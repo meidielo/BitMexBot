@@ -4,7 +4,7 @@
 Learn trading bot engineering. Build in phases. Testnet only until Phase 6.
 
 ## Current Phase
-**Phase 3 REWRITTEN — real strategy signal logic replacing placeholder EMA crossover**
+**Phase 6 IN PROGRESS — logger.py and monitor.py exist; update_trade_exit() not yet wired into main loop**
 
 ## Risk Rules (hardcoded, confirmed working)
 - Leverage: 15x fixed
@@ -46,11 +46,11 @@ monitor.py           # daily summary
 main.py              # orchestrator
 
 ## Phase Checklist
-- [ ] Phase 1: Connect to testnet, fetch candles, print to terminal
-- [ ] Phase 2: Compute indicators on candle data
-- [ ] Phase 3: Signal logic returning SHORT/LONG/NO_TRADE
-- [ ] Phase 4: Risk filter
-- [ ] Phase 5: Order execution on testnet
+- [x] Phase 1: Connect to testnet, fetch candles, print to terminal
+- [x] Phase 2: Compute indicators on candle data
+- [x] Phase 3: Signal logic returning SHORT/LONG/NO_TRADE
+- [x] Phase 4: Risk filter
+- [x] Phase 5: Order execution on testnet
 - [ ] Phase 6: Logging + monitoring
 
 ## Gate Checklist (run before any order logic)
