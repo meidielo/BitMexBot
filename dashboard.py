@@ -98,7 +98,7 @@ def _collect() -> dict:
     bot_alive = False
     if os.path.exists(LOG_PATH):
         age_s = (datetime.now().timestamp() - os.path.getmtime(LOG_PATH))
-        bot_alive = age_s < 1200
+        bot_alive = age_s < 2100   # 35 min — bot sleeps up to 15 min per loop
 
     return {
         "now":             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
