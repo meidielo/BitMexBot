@@ -1,0 +1,17 @@
+# Credentials — never commit
+.env
+
+# OHLCV output and any future data files
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
