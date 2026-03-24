@@ -26,7 +26,7 @@ from indicators     import compute_indicators
 from signals        import get_signal
 from risk           import validate_signal
 from order_manager  import execute_signal
-from logger         import log_trade
+from logger         import log_trade, update_trade_exit
 from monitor        import print_summary
 
 load_dotenv()
@@ -76,6 +76,50 @@ def _get_open_positions(exchange) -> list:
         # Return a dummy entry so risk.py blocks the trade rather than
         # accidentally opening a duplicate position.
         return [{"error": str(e)}]
+
+
+# ---------------------------------------------------------------------------
+# Exit detection helpers
+# ---------------------------------------------------------------------------
+
+def _fetch_exit_price(exchange, order_id: str, fallback: float) -> float:
+    """
+    Try to retrieve the average fill price for a closed order.
+    Falls back to the current candle close price if the exchange call fails.
+    """
+    try:
+        order = exchange.fetch_order(order_id, SYMBOL)
+        avg   = order.get("average")
+        if avg:
+            return float(avg)
+    except Exception as e:
+        print(f"[WARN] Could not fetch order {order_id} for exit price: {e}")
+    return fallback
+
+
+def _determine_exit_reason(signal: dict, exit_price: float) -> str:
+    """
+    Classify the exit as TP, SL, or MANUAL based on where the exit price
+    landed relative to the signal's sl_price / tp_price.
+    """
+    if signal is None:
+        return "MANUAL"
+    direction = signal.get("signal")
+    sl        = signal.get("sl_price")
+    tp        = signal.get("tp_price")
+    if sl is None or tp is None:
+        return "MANUAL"
+    if direction == "SHORT":
+        if exit_price <= float(tp):
+            return "TP"
+        if exit_price >= float(sl):
+            return "SL"
+    else:  # LONG
+        if exit_price >= float(tp):
+            return "TP"
+        if exit_price <= float(sl):
+            return "SL"
+    return "MANUAL"
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +197,9 @@ def main() -> None:
     except Exception as e:
         raise SystemExit(f"[ABORT] Could not create exchange client: {e}")
 
-    loop_count = 0
+    loop_count      = 0
+    active_order_id = None   # order_id of the currently open position, or None
+    active_signal   = None   # signal dict that opened the current position
 
     try:
         while True:
@@ -195,10 +241,23 @@ def main() -> None:
             print(f"  Reason   : {signal['reason']}")
 
             # ----------------------------------------------------------
-            # Step 4 — Risk validation
+            # Step 4 — Risk validation (also fetches open positions)
             # ----------------------------------------------------------
             balance        = _get_balance_usd(exchange, close_price)
             open_positions = _get_open_positions(exchange)
+
+            # ----------------------------------------------------------
+            # Step 4b — Detect position close, update exit log
+            # If we had an active order and positions are now empty,
+            # the trade has closed (TP / SL / liquidation / manual).
+            # ----------------------------------------------------------
+            if active_order_id and not open_positions:
+                print(f"\n  [EXIT] Position closed — order_id={active_order_id}")
+                exit_price  = _fetch_exit_price(exchange, active_order_id, close_price)
+                exit_reason = _determine_exit_reason(active_signal, exit_price)
+                update_trade_exit(active_order_id, exit_price, exit_reason)
+                active_order_id = None
+                active_signal   = None
 
             risk_result = validate_signal(
                 signal         = signal,
@@ -222,7 +281,7 @@ def main() -> None:
                 )
 
                 # ----------------------------------------------------------
-                # Step 6 — Log
+                # Step 6 — Log entry; track order for exit detection
                 # ----------------------------------------------------------
                 trade_dict = {
                     "order_id":          order_result.get("order_id"),
@@ -236,6 +295,11 @@ def main() -> None:
                     "order_status":      order_result["status"],
                 }
                 log_trade(trade_dict)
+
+                # Track for exit detection on subsequent loop iterations
+                if order_result.get("status") == "placed":
+                    active_order_id = order_result.get("order_id")
+                    active_signal   = signal
 
             # ----------------------------------------------------------
             # Heartbeat + sleep decision
