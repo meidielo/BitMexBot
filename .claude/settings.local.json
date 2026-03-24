@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(python fetch_data.py)",
+      "Bash(python -c \":*)",
+      "Bash(python indicators.py)",
+      "Bash(python signals.py)",
+      "Bash(python -m pytest test_risk.py -v)",
+      "Bash(python risk.py)",
+      "Bash(python logger.py)",
+      "Bash(python monitor.py)",
+      "Bash(python -m pytest test_risk.py -v --tb=short)",
+      "Bash(python audit.py)",
+      "Bash(python test_signals.py)",
+      "Bash(python -c \"from fetch_data import get_candles; print\\(''[OK] get_candles importable, points to:'', get_candles.__name__\\)\")",
+      "Bash(gh auth:*)"
+    ]
+  }
+}
