@@ -1,17 +1,18 @@
 """
-test_signals.py — Unit tests for signals.py (Phase 3 rewrite)
+test_signals.py — Unit tests for signals.py
 
 Run:  python test_signals.py
 No network calls — all tests use synthetic DataFrames.
 
 Tests
 -----
-1. SHORT fires when all four conditions are met
+1. SHORT fires when all conditions are met (including trend age >= 55)
 2. NO_TRADE when R:R < 1.5
-3. NO_TRADE when RSI is outside the valid SHORT range
+3. NO_TRADE when trend is too young (< MIN_TREND_AGE candles)
 4. NO_TRADE when upper wick is too small
 5. SL is always above entry price for SHORT signals
 6. TP is always below entry price for SHORT signals
+7. round level helpers
 """
 
 import io
@@ -24,8 +25,7 @@ from signals import (
     nearest_round_support,
     nearest_round_resistance,
     MIN_RR,
-    SHORT_RSI_MIN,
-    SHORT_RSI_MAX,
+    MIN_TREND_AGE,
     SL_LOOKBACK,
     TP_LOOKBACK,
     WICK_MIN_PCT,
@@ -38,18 +38,19 @@ from signals import (
 # Synthetic DataFrame factory
 # ---------------------------------------------------------------------------
 
-# Default candle designed so SHORT fires cleanly:
+# Default candle designed so SHORT fires cleanly.
+# _df() uses n=60 by default so trend_age=60 >= MIN_TREND_AGE (55).
 #
-#   EMA20 (69800) < EMA50 (70000)                    → C1 PASS
-#   high  (70100) > EMA20, close (69600) < EMA20     → C2 PASS
-#   upper_wick = 70100 - max(69650, 69600) = 450
-#   0.4% of 69600 = 278.4  →  450 > 278.4            → C3 PASS
-#   RSI 55 in [40–65]                                  → C4 PASS
+#   C1 EMA20 (69800) < EMA50 (70000)                     → PASS
+#   C2 trend_age = 60 >= 55                               → PASS
+#   C3 high (70100) > EMA20, close (69600) < EMA20        → PASS
+#   C4 upper_wick = 70100 - max(69650,69600) = 450
+#      0.4% of 69600 = 278.4  →  450 > 278.4             → PASS
 #
 #   swing_high5 = 70100  →  SL = 70100 + 69.6 = 70169.6
-#   sl_dist = 569.6  >  208.8 (0.3%)                  → gate PASS
+#   sl_dist = 569.6  >  208.8 (0.3%)                     → gate PASS
 #   tp = min(low_20=66000, round_support=69500) = 66000
-#   R:R = (69600-66000)/(70169.6-69600) = 3600/569.6 ≈ 6.32 ≥ 1.5  → gate PASS
+#   R:R = 3600/569.6 ≈ 6.32 ≥ 1.5                       → gate PASS
 
 BASE_ROW = {
     "open":   69650.0,
@@ -67,7 +68,7 @@ BASE_ROW = {
 }
 
 
-def _df(n: int = 20, prev_overrides: dict = None, **last_overrides) -> pd.DataFrame:
+def _df(n: int = 60, prev_overrides: dict = None, **last_overrides) -> pd.DataFrame:
     """
     Build a synthetic indicator DataFrame.
 
@@ -149,31 +150,31 @@ def test_no_trade_when_rr_below_minimum():
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — NO_TRADE when RSI is outside SHORT range [40–65]
+# Test 3 — NO_TRADE when trend is too young (< MIN_TREND_AGE candles)
 # ---------------------------------------------------------------------------
 
-def test_no_trade_when_rsi_out_of_range():
-    # RSI = 70 is above SHORT_RSI_MAX (65) AND above LONG_RSI_MAX (60)
-    # → neither SHORT nor LONG can fire
+def test_no_trade_when_trend_too_young():
+    # Only 10 candles in the DataFrame → trend_age = 10 < MIN_TREND_AGE (55)
     with _silent():
-        result = get_signal(_df(rsi_14=70.0))
+        result = get_signal(_df(n=10))
 
     assert result["signal"] == "NO_TRADE", (
-        f"Expected NO_TRADE (RSI out of range), got {result['signal']}. "
+        f"Expected NO_TRADE (trend too young), got {result['signal']}. "
         f"Reason: {result['reason']}"
     )
-    assert "RSI" in result["reason"], (
-        f"Reason should mention RSI, got: {result['reason']}"
+    assert "trend" in result["reason"].lower(), (
+        f"Reason should mention trend age, got: {result['reason']}"
     )
 
-    # Also test below the floor (RSI = 25, below SHORT_RSI_MIN=40)
+    # Boundary: exactly MIN_TREND_AGE candles should pass C2
     with _silent():
-        result_low = get_signal(_df(rsi_14=25.0))
+        result_boundary = get_signal(_df(n=MIN_TREND_AGE))
 
-    assert result_low["signal"] == "NO_TRADE", (
-        f"Expected NO_TRADE (RSI too low), got {result_low['signal']}"
+    assert result_boundary["signal"] == "SHORT", (
+        f"Expected SHORT at exactly MIN_TREND_AGE={MIN_TREND_AGE} candles, "
+        f"got {result_boundary['signal']}. Reason: {result_boundary['reason']}"
     )
-    print("[PASS] test_no_trade_when_rsi_out_of_range")
+    print("[PASS] test_no_trade_when_trend_too_young")
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +260,7 @@ def run_all():
         test_round_level_helpers,
         test_short_fires_on_all_conditions,
         test_no_trade_when_rr_below_minimum,
-        test_no_trade_when_rsi_out_of_range,
+        test_no_trade_when_trend_too_young,
         test_no_trade_when_wick_too_small,
         test_sl_above_entry_for_short,
         test_tp_below_entry_for_short,
