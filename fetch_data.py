@@ -49,6 +49,28 @@ def fetch_ohlcv(exchange=None):
 
         # Take the last LIMIT complete candles
         resampled = resampled.tail(LIMIT)
+
+        # --- candle sanity check ---
+        # A valid candle must satisfy: L <= min(O,C) <= max(O,C) <= H
+        # Testnet occasionally emits garbage ticks that violate this.
+        # Drop bad rows rather than propagating negative wicks to signals.
+        bad_mask = (
+            (resampled["high"] < resampled["open"]) |
+            (resampled["high"] < resampled["close"]) |
+            (resampled["low"]  > resampled["open"]) |
+            (resampled["low"]  > resampled["close"]) |
+            (resampled["high"] < resampled["low"])
+        )
+        n_bad = int(bad_mask.sum())
+        if n_bad > 0:
+            print(f"[WARN] Dropped {n_bad} malformed candle(s) "
+                  f"(O/H/L/C constraint violated — likely testnet garbage).")
+            resampled = resampled[~bad_mask]
+
+        if resampled.empty:
+            print("[ERROR] All candles failed sanity check — cannot proceed.")
+            return None
+
     except Exception as e:
         print(f"[ERROR] Failed to resample candles to 15m: {e}")
         return None
