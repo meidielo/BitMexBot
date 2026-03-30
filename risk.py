@@ -6,7 +6,7 @@ No exchange connection. No order placement. Pure logic.
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 
 # ---------------------------------------------------------------------------
 # Hardcoded constants — never overridden by signals, config, or AI output
@@ -14,9 +14,9 @@ from datetime import date
 LEVERAGE            = 15          # fixed leverage for every trade
 MAX_POSITION_BTC    = 0.10        # retained for audit.py / test_risk.py reference
 MAX_CONTRACTS       = 1500        # hard cap: ~0.10 BTC at typical prices
-LOT_SIZE            = 100         # BitMEX minimum order increment for XBTUSDT
 RISK_PER_TRADE_PCT  = 0.02        # 2 % of account balance risked per trade
 MAX_DAILY_LOSS_USD  = 50.0        # bot halts for the day if this is hit
+MIN_FREE_MARGIN_PCT = 0.10        # 10% — minimum free margin after position open
 
 # Liquidation buffer: liq is estimated at 90 % of the theoretical margin level.
 # Formula:
@@ -42,7 +42,7 @@ def _load_daily_loss() -> float:
             return 0.0
         with open(DAILY_LOSS_FILE, "r") as f:
             data = json.load(f)
-        if data.get("date") == str(date.today()):
+        if data.get("date") == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
             return float(data.get("loss_usd", 0.0))
         return 0.0  # stale file — different day
     except Exception as e:
@@ -169,10 +169,29 @@ def validate_signal(signal: dict, account_balance: float,
         )
 
     # ------------------------------------------------------------------
-    # Rule 5 — Position sizing (2 % risk, floored to 100, hard cap 1500 contracts)
+    # Rule 5 — Position sizing (2 % risk, hard cap 1500 contracts)
     # ------------------------------------------------------------------
     position_size_btc = _calc_position_size(account_balance)
     capped = position_size_btc >= MAX_CONTRACTS
+
+    # ------------------------------------------------------------------
+    # Rule 6 — Minimum free margin (10% of account balance)
+    #
+    # After opening the position, at least 10% of balance must remain
+    # as free margin.  Margin used ≈ notional / leverage.
+    # XBTUSDT linear: 1 contract = $1 USDT notional.
+    # So: notional = contracts (in USD), margin = contracts / leverage.
+    # ------------------------------------------------------------------
+    margin_used    = position_size_btc / LEVERAGE
+    free_after     = account_balance - margin_used
+    free_pct       = free_after / account_balance if account_balance > 0 else 0
+
+    if free_pct < MIN_FREE_MARGIN_PCT:
+        return _veto(
+            f"Rule 6 FAILED: free margin after trade would be "
+            f"${free_after:.2f} ({free_pct:.1%} of ${account_balance:.2f}). "
+            f"Minimum is {MIN_FREE_MARGIN_PCT:.0%}."
+        )
 
     # ------------------------------------------------------------------
     # All rules passed — build approval message

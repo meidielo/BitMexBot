@@ -15,7 +15,8 @@ Requires:  pip install flask
 import json
 import os
 import sqlite3
-from datetime import date, datetime, timezone
+import time as _time
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string
 
@@ -46,10 +47,9 @@ def _query(sql: str, params: tuple = ()) -> list:
     if not os.path.exists(DB_PATH):
         return []
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -67,7 +67,7 @@ def _log_tail() -> list:
 
 
 def _collect() -> dict:
-    today = str(date.today())
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     today_rows  = _query("SELECT * FROM trades WHERE date(timestamp)=? ORDER BY id DESC", (today,))
     open_pos    = _query("SELECT * FROM trades WHERE exit_price IS NULL AND order_status='placed' ORDER BY id DESC")
@@ -97,7 +97,7 @@ def _collect() -> dict:
 
     bot_alive = False
     if os.path.exists(LOG_PATH):
-        age_s = (datetime.now().timestamp() - os.path.getmtime(LOG_PATH))
+        age_s = (_time.time() - os.path.getmtime(LOG_PATH))
         bot_alive = age_s < 2100   # 35 min — bot sleeps up to 15 min per loop
 
     return {
@@ -294,7 +294,19 @@ def api_data():
 
 
 if __name__ == "__main__":
-    print(f"Dashboard running at http://0.0.0.0:{DASH_PORT}")
+    # Bind to Tailscale interface only if available, otherwise 0.0.0.0.
+    # This prevents exposure on public interfaces while allowing Tailscale access.
+    bind_host = "100.0.0.0/8"  # placeholder, detect below
+    try:
+        import subprocess
+        ts_ip = subprocess.check_output(
+            ["tailscale", "ip", "-4"], text=True, timeout=5
+        ).strip()
+        bind_host = ts_ip
+    except Exception:
+        bind_host = "0.0.0.0"  # fallback if Tailscale not available
+
+    print(f"Dashboard running at http://{bind_host}:{DASH_PORT}")
     print(f"  DB  : {os.path.abspath(DB_PATH)}")
     print(f"  Log : {os.path.abspath(LOG_PATH)}")
-    app.run(host="0.0.0.0", port=DASH_PORT, debug=False)
+    app.run(host=bind_host, port=DASH_PORT, debug=False)

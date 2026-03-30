@@ -21,13 +21,9 @@ Feature notes
 signal_rr    -- signal R:R at entry time  (available at entry)
 direction    -- 1=SHORT, 0=LONG           (available at entry)
 hour_of_day  -- UTC hour of entry_ts      (available at entry)
-duration_min -- minutes to exit           (NOT at entry; set to 0 for live scoring)
-actual_r     -- realised R-multiple       (NOT at entry; set to 0 for live scoring)
 
-duration_min and actual_r are included as training features because they
-exist in the CSV, but they must be set to 0.0 for any live prediction.
-This introduces some training bias; given the small sample size the model
-is treated as a soft filter only (see MIN_RELIABLE_SAMPLES warning).
+Only features available at signal time are used. Previous versions included
+duration_min and actual_r (outcome variables), which caused data leakage.
 """
 
 import argparse
@@ -52,10 +48,13 @@ FEATURES_PATH = os.path.join(DATA_DIR, "ml_features.json")
 # ---------------------------------------------------------------------------
 # Feature / label config
 # ---------------------------------------------------------------------------
-FEATURES = ["signal_rr", "direction", "hour_of_day", "duration_min", "actual_r"]
+FEATURES = ["signal_rr", "direction", "hour_of_day"]
 LABEL    = "label"
 
 MIN_RELIABLE_SAMPLES = 200   # below this count, print reliability warning
+
+# Module-level cache for the trained model (loaded once, reused)
+_cached_clf = None
 
 
 # ---------------------------------------------------------------------------
@@ -85,8 +84,6 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["hour_of_day"] = pd.to_datetime(
         resolved["entry_ts"].str.replace(" UTC", "", regex=False)
     ).dt.hour.astype(int)
-    out["duration_min"] = resolved["duration_min"].astype(float)
-    out["actual_r"]     = resolved["actual_r"].astype(float)
     out[LABEL]          = (resolved["outcome"] == "TP").astype(int)
 
     return out.reset_index(drop=True)
@@ -194,22 +191,25 @@ def score_signal(signal_dict: dict) -> float:
             f"Run:  python ml_filter.py --retrain"
         )
 
-    clf = joblib.load(MODEL_PATH)
+    global _cached_clf
+    if _cached_clf is None:
+        _cached_clf = joblib.load(MODEL_PATH)
 
     direction = 1 if signal_dict.get("signal") == "SHORT" else 0
     signal_rr = float(signal_dict.get("rr") or 0.0)
-    hour      = datetime.datetime.utcnow().hour   # live: current hour = entry hour
+    hour      = datetime.datetime.now(datetime.timezone.utc).hour
 
     row = pd.DataFrame([{
         "signal_rr":    signal_rr,
         "direction":    direction,
         "hour_of_day":  hour,
-        "duration_min": 0.0,
-        "actual_r":     0.0,
     }])[FEATURES]
 
-    prob = float(clf.predict_proba(row)[0][1])
-    return prob
+    proba = _cached_clf.predict_proba(row)[0]
+    # Handle single-class edge case
+    if len(proba) < 2:
+        return 0.5
+    return float(proba[1])
 
 
 # ---------------------------------------------------------------------------
