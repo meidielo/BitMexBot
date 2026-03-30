@@ -30,7 +30,7 @@ FUNDING_SYMBOL   = "BTC/USDT:USDT"
 WICK_MIN_PCT     = 0.0005  # 0.05% — lowered to generate trades on testnet
 SL_BUFFER_PCT    = 0.001   # 0.1% buffer beyond swing high/low
 SL_MIN_DIST_PCT  = 0.003   # 0.3% — if SL is closer than this, skip (noise)
-MIN_RR           = 2.0     # minimum reward-to-risk ratio
+MIN_RR           = 1.5     # minimum reward-to-risk ratio
 MIN_TREND_AGE    = 20      # consecutive candles in trend required for entry
 TP_ROUND_STEP    = 500     # round-number level spacing for TP targets
 
