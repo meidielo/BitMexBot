@@ -147,8 +147,8 @@ def _poll_for_fill(exchange, order_id: str) -> dict | None:
     Returns the filled order dict on success, None on timeout or external cancel.
     The caller is responsible for cancelling open orders if None is returned.
     """
-    elapsed = 0
-    while elapsed < FILL_TIMEOUT:
+    start = time.time()
+    while (time.time() - start) < FILL_TIMEOUT:
         try:
             order = exchange.fetch_order(order_id, SYMBOL)
         except Exception as e:
@@ -163,13 +163,13 @@ def _poll_for_fill(exchange, order_id: str) -> dict | None:
             print(f"[WARN] Entry order {order_id} was cancelled externally.")
             return None
 
+        elapsed = int(time.time() - start)
         print(
             f"[POLL] Entry {order_id} — status: {order['status']}  "
             f"filled: {order.get('filled', 0)}/{order.get('amount', '?')}  "
             f"({elapsed}s elapsed)"
         )
         time.sleep(FILL_POLL_INTERVAL)
-        elapsed += FILL_POLL_INTERVAL
 
     print(f"[TIMEOUT] Entry order {order_id} did not fill within {FILL_TIMEOUT}s.")
     return None
@@ -266,9 +266,25 @@ def execute_signal(signal: dict, validated_risk: dict) -> dict:
     try:
         exchange.set_leverage(LEVERAGE, SYMBOL)
     except Exception:
-        # Silently continue. BitMEX multi-asset accounts use cross margin
-        # and do not support per-symbol isolated leverage — this call will
-        # always fail on those accounts. Cross margin at 15x is acceptable.
+        # BitMEX multi-asset accounts use cross margin and do not support
+        # per-symbol isolated leverage — this call may fail on those accounts.
+        pass
+
+    # Verify leverage is actually set to expected value
+    try:
+        positions = exchange.fetch_positions([SYMBOL])
+        for pos in positions:
+            actual_lev = pos.get("leverage")
+            if actual_lev is not None and float(actual_lev) != LEVERAGE:
+                return _result(
+                    "failed",
+                    error=(
+                        f"Leverage mismatch: expected {LEVERAGE}x but account "
+                        f"has {actual_lev}x. Fix manually on BitMEX before trading."
+                    ),
+                )
+    except Exception:
+        # If we can't verify, proceed cautiously — set_leverage was attempted
         pass
 
     # ------------------------------------------------------------------

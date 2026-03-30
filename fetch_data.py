@@ -2,7 +2,7 @@ import os
 import csv
 from datetime import datetime
 import pandas as pd
-from bitmex_client import get_exchange
+from bitmex_client import get_data_client
 
 # BitMEX does not support 15m natively (valid: 1m, 5m, 1h, 1d).
 # We fetch 300 x 5m candles and resample to get exactly 100 x 15m candles.
@@ -18,9 +18,9 @@ OUTPUT_FILE = os.path.join(OUTPUT_DIR, "ohlcv.csv")
 def fetch_ohlcv(exchange=None):
     if exchange is None:
         try:
-            exchange = get_exchange()
+            exchange = get_data_client()
         except Exception as e:
-            print(f"[ERROR] Failed to initialise exchange client: {e}")
+            print(f"[ERROR] Failed to initialise data client: {e}")
             return None
 
     try:
@@ -33,12 +33,33 @@ def fetch_ohlcv(exchange=None):
         print("[ERROR] No candles returned from exchange.")
         return None
 
-    # --- resample 5m → 15m via pandas ---
+    # --- clean raw 5m candles BEFORE resampling ---
+    # BitMEX often returns malformed candles (O > H, C > H, etc.)
+    # for recently-closed or still-forming bars.  Drop them so that
+    # the resample only uses clean data → proper wicks on 15m candles.
     try:
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df = df.set_index("timestamp")
 
+        # Drop 5m candles where OHLC constraints are violated
+        bad_5m = (
+            (df["high"] < df["open"]) |
+            (df["high"] < df["close"]) |
+            (df["low"]  > df["open"]) |
+            (df["low"]  > df["close"]) |
+            (df["high"] < df["low"])
+        )
+        n_bad_5m = int(bad_5m.sum())
+        if n_bad_5m > 0:
+            print(f"[INFO] Dropped {n_bad_5m} malformed 5m candle(s) before resample.")
+            df = df[~bad_5m]
+
+        if df.empty:
+            print("[ERROR] All 5m candles failed sanity check — cannot proceed.")
+            return None
+
+        # --- resample 5m → 15m ---
         resampled = df.resample(TARGET_TIMEFRAME).agg({
             "open":   "first",
             "high":   "max",
@@ -49,27 +70,6 @@ def fetch_ohlcv(exchange=None):
 
         # Take the last LIMIT complete candles
         resampled = resampled.tail(LIMIT)
-
-        # --- candle sanity check ---
-        # A valid candle must satisfy: L <= min(O,C) <= max(O,C) <= H
-        # Testnet occasionally emits garbage ticks that violate this.
-        # Drop bad rows rather than propagating negative wicks to signals.
-        bad_mask = (
-            (resampled["high"] < resampled["open"]) |
-            (resampled["high"] < resampled["close"]) |
-            (resampled["low"]  > resampled["open"]) |
-            (resampled["low"]  > resampled["close"]) |
-            (resampled["high"] < resampled["low"])
-        )
-        n_bad = int(bad_mask.sum())
-        if n_bad > 0:
-            print(f"[WARN] Dropped {n_bad} malformed candle(s) "
-                  f"(O/H/L/C constraint violated — likely testnet garbage).")
-            resampled = resampled[~bad_mask]
-
-        if resampled.empty:
-            print("[ERROR] All candles failed sanity check — cannot proceed.")
-            return None
 
     except Exception as e:
         print(f"[ERROR] Failed to resample candles to 15m: {e}")
@@ -106,7 +106,7 @@ def save_to_csv(df):
 get_candles = fetch_ohlcv  # alias for callers that import get_candles
 
 if __name__ == "__main__":
-    print(f"Fetching {RAW_LIMIT} x {RAW_TIMEFRAME} candles for {SYMBOL} from BitMEX testnet,")
+    print(f"Fetching {RAW_LIMIT} x {RAW_TIMEFRAME} candles for {SYMBOL} from BitMEX mainnet,")
     print(f"resampling to {LIMIT} x 15m candles...\n")
     df = fetch_ohlcv()
     if df is not None:

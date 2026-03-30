@@ -1,5 +1,7 @@
 # Credentials — never commit
 .env
+.env.*
+!.env.example
 
 # OHLCV output and any future data files
 data/
@@ -12,6 +14,13 @@ __pycache__/
 venv/
 env/
 
+# Database files outside data/
+*.db
+*.sqlite3
+
 # IDE
 .vscode/
 .idea/
+
+# Logs
+logs/

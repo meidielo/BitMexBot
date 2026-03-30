@@ -339,9 +339,6 @@ def _sleep_to_next_bar(loop_start: float) -> None:
     """Sleep for the remainder of the 15-minute candle period."""
     elapsed    = time.time() - loop_start
     sleep_secs = max(0.0, LOOP_SLEEP - elapsed)
-    wake_utc   = datetime.now(timezone.utc).replace(
-        second=0, microsecond=0
-    )
     print(
         f"\n  Sleeping {sleep_secs:.0f}s  "
         f"(execution took {elapsed:.1f}s of {LOOP_SLEEP}s bar)"

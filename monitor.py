@@ -7,7 +7,7 @@ No exchange connection.  Pure read from local storage.
 
 import os
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from logger import DB_PATH, _connect, _init_db
 
@@ -72,7 +72,7 @@ def _print_todays_trades(today: str) -> None:
     closed  = [r for r in rows if r["exit_price"] is not None]
     open_   = [r for r in rows if r["exit_price"] is None]
     wins    = [r for r in closed if (r["pnl_usd"] or 0) > 0]
-    losses  = [r for r in closed if (r["pnl_usd"] or 0) <= 0]
+    losses  = [r for r in closed if (r["pnl_usd"] or 0) < 0]
     pnl_sum = sum((r["pnl_usd"] or 0) for r in closed)
 
     print(f"  Total attempts  : {len(rows)}")
@@ -117,18 +117,17 @@ def _print_running_pnl() -> None:
 def _print_daily_loss_status(today: str) -> None:
     _section("DAILY LOSS LIMIT")
 
-    daily_loss_raw = _scalar(
+    daily_loss = _scalar(
         """
-        SELECT COALESCE(SUM(pnl_usd), 0.0)
+        SELECT COALESCE(SUM(ABS(pnl_usd)), 0.0)
           FROM trades
          WHERE date(timestamp) = ?
            AND exit_price IS NOT NULL
+           AND pnl_usd < 0
         """,
         (today,),
         default=0.0,
     )
-    # daily_loss is the amount lost today (positive = money lost)
-    daily_loss = abs(daily_loss_raw) if daily_loss_raw < 0 else 0.0
     remaining  = MAX_DAILY_LOSS_USD - daily_loss
     pct_used   = daily_loss / MAX_DAILY_LOSS_USD * 100
 
@@ -181,7 +180,7 @@ def _print_open_positions() -> None:
 def print_summary() -> None:
     """Print the full daily summary block to terminal."""
     now   = datetime.now(timezone.utc)
-    today = str(date.today())
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     print()
     print("=" * 60)

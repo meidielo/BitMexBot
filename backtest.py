@@ -195,6 +195,22 @@ def resample_to_15m(raw: list) -> pd.DataFrame:
          "close": "last", "volume": "sum"}
     ).dropna()
 
+    # Repair minor OHLC violations (resample artifacts)
+    impossible = resampled["high"] < resampled["low"]
+    n_impossible = int(impossible.sum())
+    if n_impossible > 0:
+        print(f"[WARN] Dropped {n_impossible} impossible candle(s) (H < L).")
+        resampled = resampled[~impossible]
+
+    oc_max = resampled[["open", "close"]].max(axis=1)
+    oc_min = resampled[["open", "close"]].min(axis=1)
+    needs_fix = (resampled["high"] < oc_max) | (resampled["low"] > oc_min)
+    n_fix = int(needs_fix.sum())
+    if n_fix > 0:
+        resampled.loc[:, "high"] = resampled["high"].clip(lower=oc_max)
+        resampled.loc[:, "low"]  = resampled["low"].clip(upper=oc_min)
+        print(f"[INFO] Repaired {n_fix} candle(s) (H/L adjusted to cover O/C).")
+
     print(
         f"[OK] Resampled to {len(resampled):,} x 15m candles  "
         f"({resampled.index[0].strftime('%Y-%m-%d')} "
@@ -320,6 +336,12 @@ def run_backtest(df: pd.DataFrame) -> list:
     n        = len(df)
     i        = MIN_WARMUP   # first index we evaluate signals at
 
+    # Disable ML filter during backtest — it was trained on backtest data,
+    # so using it here is circular look-ahead bias.
+    import signals as _sig_mod
+    _orig_ml = getattr(_sig_mod, "_ML_AVAILABLE", False)
+    _sig_mod._ML_AVAILABLE = False
+
     print(f"Running backtest on {n:,} candles "
           f"(signal scan starts at index {MIN_WARMUP})...\n")
 
@@ -430,6 +452,9 @@ def run_backtest(df: pd.DataFrame) -> list:
 
         # Advance past the exit candle — no overlapping trades
         i = exit_idx + 1
+
+    # Restore ML flag
+    _sig_mod._ML_AVAILABLE = _orig_ml
 
     return trades
 

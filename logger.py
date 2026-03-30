@@ -10,7 +10,7 @@ No exchange connection.  Pure read/write to local storage.
 import json
 import os
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 DB_DIR          = "data"
 DB_PATH         = os.path.join(DB_DIR, "trades.db")
@@ -67,24 +67,24 @@ def _update_daily_loss_file() -> None:
     data/daily_loss.json so risk.py can read it on the next loop iteration.
 
     Only closed trades (exit_price IS NOT NULL) with a negative PnL count.
+    Uses GROSS losses (sum of all losing trades), not net PnL.
     Losses are stored as positive numbers in the file.
     """
-    today = str(date.today())
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         with _connect() as conn:
             row = conn.execute(
                 """
-                SELECT COALESCE(SUM(pnl_usd), 0.0) AS total_pnl
+                SELECT COALESCE(SUM(ABS(pnl_usd)), 0.0) AS gross_loss
                 FROM trades
                 WHERE date(timestamp) = ?
                   AND exit_price IS NOT NULL
+                  AND pnl_usd < 0
                 """,
                 (today,),
             ).fetchone()
 
-        total_pnl = float(row["total_pnl"])
-        # daily_loss is the absolute loss (positive number); gains are 0 loss.
-        daily_loss = abs(total_pnl) if total_pnl < 0 else 0.0
+        daily_loss = float(row["gross_loss"])
 
         os.makedirs(DB_DIR, exist_ok=True)
         with open(DAILY_LOSS_FILE, "w") as f:
@@ -180,28 +180,26 @@ def update_trade_exit(order_id: str, exit_price: float,
                 (order_id,),
             ).fetchone()
 
-        if row is None:
-            print(f"[WARN] update_trade_exit: no row found for order_id '{order_id}'")
-            return False
+            if row is None:
+                print(f"[WARN] update_trade_exit: no row found for order_id '{order_id}'")
+                return False
 
-        entry_price       = float(row["entry_price"])
-        position_size_btc = float(row["position_size_btc"])
-        signal            = row["signal"]
-        opened_at         = datetime.fromisoformat(row["timestamp"].replace(" ", "T"))
-        # Make opened_at timezone-aware so we can subtract from utcnow
-        opened_at         = opened_at.replace(tzinfo=timezone.utc)
+            entry_price       = float(row["entry_price"])
+            position_size_btc = float(row["position_size_btc"])
+            signal            = row["signal"]
+            opened_at         = datetime.fromisoformat(row["timestamp"].replace(" ", "T"))
+            opened_at         = opened_at.replace(tzinfo=timezone.utc)
 
-        # PnL
-        if signal == "LONG":
-            pnl_usd = (exit_price - entry_price) * position_size_btc
-        else:  # SHORT
-            pnl_usd = (entry_price - exit_price) * position_size_btc
+            # PnL
+            if signal == "LONG":
+                pnl_usd = (exit_price - entry_price) * position_size_btc
+            else:  # SHORT
+                pnl_usd = (entry_price - exit_price) * position_size_btc
 
-        duration_seconds = int(
-            (datetime.now(timezone.utc) - opened_at).total_seconds()
-        )
+            duration_seconds = int(
+                (datetime.now(timezone.utc) - opened_at).total_seconds()
+            )
 
-        with _connect() as conn:
             conn.execute(
                 """
                 UPDATE trades
