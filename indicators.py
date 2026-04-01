@@ -15,6 +15,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
         rsi_14               — Relative Strength Index (14-period) on close
         bb_upper, bb_mid,    — Bollinger Bands (20-period, 2 std dev) on close
         bb_lower
+        adx_14               — Average Directional Index (14-period)
     Returns enriched DataFrame, or None on error.
     Note: the first N-1 rows of each indicator will be NaN (warm-up period).
     """
@@ -52,6 +53,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
         df["bb_lower"] = bb[col_lower]
     except Exception as e:
         print(f"[ERROR] Failed to compute Bollinger Bands: {e}")
+        return None
+
+    # --- ADX ---
+    try:
+        adx_df = ta.adx(df["high"], df["low"], df["close"], length=14)
+        col_adx = next(c for c in adx_df.columns if c.startswith("ADX"))
+        df["adx_14"] = adx_df[col_adx]
+    except Exception as e:
+        print(f"[ERROR] Failed to compute ADX: {e}")
         return None
 
     return df

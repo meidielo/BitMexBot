@@ -50,11 +50,14 @@ EMA_CROSS_BODY_MIN_PCT = 0.001  # candle body must be >= 0.1% of close (convicti
 RSI_EXTREME_LOW  = 30      # RSI was below this, now above → LONG
 RSI_EXTREME_HIGH = 70      # RSI was above this, now below → SHORT
 
+# ADX filter — applied to S3 and S4 to avoid whipsaws in choppy markets
+ADX_MIN          = 25      # ADX must be >= 25 to confirm trend strength
+
 SL_LOOKBACK      = 5       # candles back for swing high/low SL
 TP_LOOKBACK      = 20      # candles back for extreme-level TP target
 
 REQUIRED_COLS    = ["open", "high", "low", "close", "ema_20", "ema_50", "rsi_14",
-                    "bb_upper", "bb_mid", "bb_lower"]
+                    "bb_upper", "bb_mid", "bb_lower", "adx_14"]
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +633,8 @@ def get_signal(df: pd.DataFrame, exchange=None) -> dict:
     # ------------------------------------------------------------------
     prev = df.iloc[-2] if len(df) >= 2 else None
     body_pct = abs(c - o) / c if c > 0 else 0
+    adx = float(latest["adx_14"])
+    adx_ok = adx >= ADX_MIN
 
     if prev is not None:
         prev_ema20 = float(prev["ema_20"])
@@ -643,19 +648,23 @@ def get_signal(df: pd.DataFrame, exchange=None) -> dict:
 
     ec_l1 = cross_long
     ec_l2 = bullish_body and body_ok
+    ec_l3 = adx_ok
     ec_s1 = cross_short
     ec_s2 = bearish_body and body_ok
+    ec_s3 = adx_ok
 
-    print(f"\n  [S3] EMA crossover:")
+    print(f"\n  [S3] EMA crossover (ADX={adx:.2f}, min={ADX_MIN}):")
     print(f"  Prev EMA20={prev_ema20:.2f}  Prev EMA50={prev_ema50:.2f}")
     print(f"  Body={body_pct*100:.3f}% (min={EMA_CROSS_BODY_MIN_PCT*100:.1f}%)")
     print(f"  {_pf(ec_s1)} Cross SHORT: prev EMA20 >= EMA50, now EMA20 < EMA50")
     print(f"  {_pf(ec_s2)} Bearish body with conviction")
+    print(f"  {_pf(ec_s3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
     print(f"  {_pf(ec_l1)} Cross LONG:  prev EMA20 <= EMA50, now EMA20 > EMA50")
     print(f"  {_pf(ec_l2)} Bullish body with conviction")
+    print(f"  {_pf(ec_l3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
 
     # --- EMA Cross SHORT ---
-    if ec_s1 and ec_s2:
+    if ec_s1 and ec_s2 and ec_s3:
         sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
         sl_price = round(sl_raw, 2)
         sl_dist  = sl_price - entry
@@ -685,7 +694,7 @@ def get_signal(df: pd.DataFrame, exchange=None) -> dict:
                     }
 
     # --- EMA Cross LONG ---
-    if ec_l1 and ec_l2:
+    if ec_l1 and ec_l2 and ec_l3:
         sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
         sl_price = round(sl_raw, 2)
         sl_dist  = entry - sl_price
@@ -730,18 +739,22 @@ def get_signal(df: pd.DataFrame, exchange=None) -> dict:
 
     rs_l1 = rsi_long
     rs_l2 = bullish_body and body_ok
+    rs_l3 = adx_ok
     rs_s1 = rsi_short
     rs_s2 = bearish_body and body_ok
+    rs_s3 = adx_ok
 
-    print(f"\n  [S4] RSI reversal:")
+    print(f"\n  [S4] RSI reversal (ADX={adx:.2f}, min={ADX_MIN}):")
     print(f"  Prev RSI={prev_rsi:.2f}  Current RSI={rsi:.2f}")
     print(f"  {_pf(rs_s1)} RSI exit overbought: prev > {RSI_EXTREME_HIGH}, now <= {RSI_EXTREME_HIGH}")
     print(f"  {_pf(rs_s2)} Bearish body with conviction")
+    print(f"  {_pf(rs_s3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
     print(f"  {_pf(rs_l1)} RSI exit oversold:   prev < {RSI_EXTREME_LOW}, now >= {RSI_EXTREME_LOW}")
     print(f"  {_pf(rs_l2)} Bullish body with conviction")
+    print(f"  {_pf(rs_l3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
 
     # --- RSI Reversal SHORT ---
-    if rs_s1 and rs_s2:
+    if rs_s1 and rs_s2 and rs_s3:
         sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
         sl_price = round(sl_raw, 2)
         sl_dist  = sl_price - entry
@@ -769,7 +782,7 @@ def get_signal(df: pd.DataFrame, exchange=None) -> dict:
                     }
 
     # --- RSI Reversal LONG ---
-    if rs_l1 and rs_l2:
+    if rs_l1 and rs_l2 and rs_l3:
         sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
         sl_price = round(sl_raw, 2)
         sl_dist  = entry - sl_price
