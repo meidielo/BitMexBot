@@ -43,6 +43,13 @@ LONG_RSI_MAX     = 60
 BB_RSI_OVERSOLD  = 35      # RSI must be below this for BB LONG
 BB_RSI_OVERBOUGHT = 65     # RSI must be above this for BB SHORT
 
+# Strategy 3 — EMA crossover (trend change entry)
+EMA_CROSS_BODY_MIN_PCT = 0.001  # candle body must be >= 0.1% of close (conviction)
+
+# Strategy 4 — RSI reversal (extreme exit)
+RSI_EXTREME_LOW  = 30      # RSI was below this, now above → LONG
+RSI_EXTREME_HIGH = 70      # RSI was above this, now below → SHORT
+
 SL_LOOKBACK      = 5       # candles back for swing high/low SL
 TP_LOOKBACK      = 20      # candles back for extreme-level TP target
 
@@ -614,6 +621,180 @@ def get_signal(df: pd.DataFrame, exchange=None) -> dict:
             "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
             "rr": rr, "funding_rate": funding_rate, "ml_score": None,
         }
+
+    # ------------------------------------------------------------------
+    # === Strategy 3: EMA crossover (trend change entry) ===
+    # Fires when EMA20 just crossed EMA50 (previous candle was opposite).
+    # LONG:  prev EMA20 <= EMA50, now EMA20 > EMA50, bullish body
+    # SHORT: prev EMA20 >= EMA50, now EMA20 < EMA50, bearish body
+    # ------------------------------------------------------------------
+    prev = df.iloc[-2] if len(df) >= 2 else None
+    body_pct = abs(c - o) / c if c > 0 else 0
+
+    if prev is not None:
+        prev_ema20 = float(prev["ema_20"])
+        prev_ema50 = float(prev["ema_50"])
+        cross_long  = prev_ema20 <= prev_ema50 and ema20 > ema50
+        cross_short = prev_ema20 >= prev_ema50 and ema20 < ema50
+        body_ok     = body_pct >= EMA_CROSS_BODY_MIN_PCT
+    else:
+        prev_ema20 = prev_ema50 = 0
+        cross_long = cross_short = body_ok = False
+
+    ec_l1 = cross_long
+    ec_l2 = bullish_body and body_ok
+    ec_s1 = cross_short
+    ec_s2 = bearish_body and body_ok
+
+    print(f"\n  [S3] EMA crossover:")
+    print(f"  Prev EMA20={prev_ema20:.2f}  Prev EMA50={prev_ema50:.2f}")
+    print(f"  Body={body_pct*100:.3f}% (min={EMA_CROSS_BODY_MIN_PCT*100:.1f}%)")
+    print(f"  {_pf(ec_s1)} Cross SHORT: prev EMA20 >= EMA50, now EMA20 < EMA50")
+    print(f"  {_pf(ec_s2)} Bearish body with conviction")
+    print(f"  {_pf(ec_l1)} Cross LONG:  prev EMA20 <= EMA50, now EMA20 > EMA50")
+    print(f"  {_pf(ec_l2)} Bullish body with conviction")
+
+    # --- EMA Cross SHORT ---
+    if ec_s1 and ec_s2:
+        sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
+        sl_price = round(sl_raw, 2)
+        sl_dist  = sl_price - entry
+
+        if sl_dist >= entry * SL_MIN_DIST_PCT:
+            tp_c1 = low_20
+            tp_c2 = nearest_round_support(entry, step=TP_ROUND_STEP)
+            tp_price = round(min(tp_c1, tp_c2), 2)
+            gain = entry - tp_price
+            risk = sl_price - entry
+
+            if risk > 0 and gain > 0:
+                rr = round(gain / risk, 2)
+                if rr >= MIN_RR:
+                    reason = (
+                        f"EMA Cross SHORT: EMA20 crossed below EMA50 "
+                        f"(prev {prev_ema20:.2f}/{prev_ema50:.2f}, now {ema20:.2f}/{ema50:.2f}), "
+                        f"bearish body {body_pct*100:.3f}%, "
+                        f"SL={sl_price:.2f}, TP={tp_price:.2f}, R:R={rr:.2f}"
+                    )
+                    print(f"\n  [S3 SHORT] entry={entry:.2f}  SL={sl_price:.2f}"
+                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
+                    return {
+                        "signal": "SHORT", "reason": reason, "strategy": "ema_cross",
+                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
+                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
+                    }
+
+    # --- EMA Cross LONG ---
+    if ec_l1 and ec_l2:
+        sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
+        sl_price = round(sl_raw, 2)
+        sl_dist  = entry - sl_price
+
+        if sl_dist >= entry * SL_MIN_DIST_PCT:
+            tp_c1 = high_20
+            tp_c2 = nearest_round_resistance(entry, step=TP_ROUND_STEP)
+            tp_price = round(max(tp_c1, tp_c2), 2)
+            gain = tp_price - entry
+            risk = entry - sl_price
+
+            if risk > 0 and gain > 0:
+                rr = round(gain / risk, 2)
+                if rr >= MIN_RR:
+                    reason = (
+                        f"EMA Cross LONG: EMA20 crossed above EMA50 "
+                        f"(prev {prev_ema20:.2f}/{prev_ema50:.2f}, now {ema20:.2f}/{ema50:.2f}), "
+                        f"bullish body {body_pct*100:.3f}%, "
+                        f"SL={sl_price:.2f}, TP={tp_price:.2f}, R:R={rr:.2f}"
+                    )
+                    print(f"\n  [S3 LONG] entry={entry:.2f}  SL={sl_price:.2f}"
+                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
+                    return {
+                        "signal": "LONG", "reason": reason, "strategy": "ema_cross",
+                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
+                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
+                    }
+
+    # ------------------------------------------------------------------
+    # === Strategy 4: RSI reversal (extreme exit) ===
+    # Fires when RSI just exited an extreme zone.
+    # LONG:  prev RSI < 30, now RSI >= 30, bullish body
+    # SHORT: prev RSI > 70, now RSI <= 70, bearish body
+    # ------------------------------------------------------------------
+    if prev is not None and not pd.isna(prev["rsi_14"]):
+        prev_rsi = float(prev["rsi_14"])
+    else:
+        prev_rsi = 50.0  # neutral default
+
+    rsi_long  = prev_rsi < RSI_EXTREME_LOW and rsi >= RSI_EXTREME_LOW
+    rsi_short = prev_rsi > RSI_EXTREME_HIGH and rsi <= RSI_EXTREME_HIGH
+
+    rs_l1 = rsi_long
+    rs_l2 = bullish_body and body_ok
+    rs_s1 = rsi_short
+    rs_s2 = bearish_body and body_ok
+
+    print(f"\n  [S4] RSI reversal:")
+    print(f"  Prev RSI={prev_rsi:.2f}  Current RSI={rsi:.2f}")
+    print(f"  {_pf(rs_s1)} RSI exit overbought: prev > {RSI_EXTREME_HIGH}, now <= {RSI_EXTREME_HIGH}")
+    print(f"  {_pf(rs_s2)} Bearish body with conviction")
+    print(f"  {_pf(rs_l1)} RSI exit oversold:   prev < {RSI_EXTREME_LOW}, now >= {RSI_EXTREME_LOW}")
+    print(f"  {_pf(rs_l2)} Bullish body with conviction")
+
+    # --- RSI Reversal SHORT ---
+    if rs_s1 and rs_s2:
+        sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
+        sl_price = round(sl_raw, 2)
+        sl_dist  = sl_price - entry
+
+        if sl_dist >= entry * SL_MIN_DIST_PCT:
+            tp_price = round(bb_mid, 2)  # mean-reversion to BB mid
+            gain = entry - tp_price
+            risk = sl_price - entry
+
+            if risk > 0 and gain > 0:
+                rr = round(gain / risk, 2)
+                if rr >= MIN_RR:
+                    reason = (
+                        f"RSI Reversal SHORT: RSI exited overbought "
+                        f"(prev {prev_rsi:.2f} > {RSI_EXTREME_HIGH}, now {rsi:.2f}), "
+                        f"bearish body {body_pct*100:.3f}%, "
+                        f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
+                    )
+                    print(f"\n  [S4 SHORT] entry={entry:.2f}  SL={sl_price:.2f}"
+                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
+                    return {
+                        "signal": "SHORT", "reason": reason, "strategy": "rsi_reversal",
+                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
+                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
+                    }
+
+    # --- RSI Reversal LONG ---
+    if rs_l1 and rs_l2:
+        sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
+        sl_price = round(sl_raw, 2)
+        sl_dist  = entry - sl_price
+
+        if sl_dist >= entry * SL_MIN_DIST_PCT:
+            tp_price = round(bb_mid, 2)  # mean-reversion to BB mid
+            gain = tp_price - entry
+            risk = entry - sl_price
+
+            if risk > 0 and gain > 0:
+                rr = round(gain / risk, 2)
+                if rr >= MIN_RR:
+                    reason = (
+                        f"RSI Reversal LONG: RSI exited oversold "
+                        f"(prev {prev_rsi:.2f} < {RSI_EXTREME_LOW}, now {rsi:.2f}), "
+                        f"bullish body {body_pct*100:.3f}%, "
+                        f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
+                    )
+                    print(f"\n  [S4 LONG] entry={entry:.2f}  SL={sl_price:.2f}"
+                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
+                    return {
+                        "signal": "LONG", "reason": reason, "strategy": "rsi_reversal",
+                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
+                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
+                    }
 
     # ------------------------------------------------------------------
     # === NO_TRADE — explain failed conditions ===
