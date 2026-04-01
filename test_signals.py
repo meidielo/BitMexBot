@@ -47,6 +47,7 @@ from signals import (
     EMA_CROSS_BODY_MIN_PCT,
     RSI_EXTREME_LOW,
     RSI_EXTREME_HIGH,
+    ADX_MIN,
 )
 
 # Disable ML filter for unit tests — it would block synthetic signals
@@ -84,6 +85,7 @@ BASE_ROW = {
     "bb_upper": 71000.0,
     "bb_mid":   69500.0,
     "bb_lower": 68000.0,
+    "adx_14":   30.0,
 }
 
 
@@ -139,6 +141,7 @@ LONG_BASE_ROW = {
     "bb_upper": 73000.0,
     "bb_mid":   70000.0,
     "bb_lower": 68000.0,
+    "adx_14":   30.0,
 }
 
 
@@ -439,6 +442,7 @@ BB_LONG_ROW = {
     "bb_upper": 71000.0,
     "bb_mid":   70000.0,
     "bb_lower": 69000.0,
+    "adx_14":   30.0,
 }
 
 # BB SHORT: price spikes above upper BB, closes back inside, RSI overbought, bearish body
@@ -464,6 +468,7 @@ BB_SHORT_ROW = {
     "bb_upper": 71000.0,
     "bb_mid":   70000.0,
     "bb_lower": 69000.0,
+    "adx_14":   30.0,
 }
 
 
@@ -583,6 +588,7 @@ EMA_CROSS_LONG_ROW = {
     "bb_upper": 72000.0,
     "bb_mid":   70000.0,
     "bb_lower": 67000.0,    # far from price
+    "adx_14":   30.0,       # above ADX_MIN=25
 }
 
 EMA_CROSS_LONG_PREV = {
@@ -597,6 +603,7 @@ EMA_CROSS_LONG_PREV = {
     "bb_upper": 72000.0,
     "bb_mid":   70000.0,
     "bb_lower": 67000.0,
+    "adx_14":   30.0,
 }
 
 
@@ -612,12 +619,14 @@ def _df_ema_cross(direction: str = "LONG", n: int = 60) -> pd.DataFrame:
             "volume": 1000.0,
             "ema_20": 69400.0, "ema_50": 69500.0,  # EMA20 just crossed below
             "rsi_14": 45.0, "bb_upper": 72000.0, "bb_mid": 70000.0, "bb_lower": 67000.0,
+            "adx_14": 30.0,
         }
         prev_row = {
             "open": 69600.0, "high": 69800.0, "low": 66000.0, "close": 69500.0,
             "volume": 1000.0,
             "ema_20": 69500.0, "ema_50": 69500.0,  # equal
             "rsi_14": 50.0, "bb_upper": 72000.0, "bb_mid": 70000.0, "bb_lower": 67000.0,
+            "adx_14": 30.0,
         }
     rows = [{**prev_row} for _ in range(n)]
     rows[-1] = {**last_row}
@@ -678,6 +687,7 @@ RSI_REV_LONG_ROW = {
     "bb_upper": 72000.0,
     "bb_mid":   70500.0,    # TP target — above entry for LONG
     "bb_lower": 67000.0,    # far from price
+    "adx_14":   30.0,
 }
 
 RSI_REV_LONG_PREV = {
@@ -692,6 +702,7 @@ RSI_REV_LONG_PREV = {
     "bb_upper": 72000.0,
     "bb_mid":   70500.0,    # TP = bb_mid = 70500 (above entry 69400)
     "bb_lower": 67000.0,
+    "adx_14":   30.0,
 }
 
 
@@ -708,6 +719,7 @@ def _df_rsi_rev(direction: str = "LONG", n: int = 60) -> pd.DataFrame:
             "ema_20": 69500.0, "ema_50": 69500.0,
             "rsi_14": 68.0,  # just exited overbought
             "bb_upper": 72000.0, "bb_mid": 68000.0, "bb_lower": 67000.0,
+            "adx_14": 30.0,
         }
         prev_row = {
             "open": 69500.0, "high": 69800.0, "low": 69400.0, "close": 69600.0,
@@ -715,6 +727,7 @@ def _df_rsi_rev(direction: str = "LONG", n: int = 60) -> pd.DataFrame:
             "ema_20": 69500.0, "ema_50": 69500.0,
             "rsi_14": 72.0,  # was overbought
             "bb_upper": 72000.0, "bb_mid": 68000.0, "bb_lower": 67000.0,
+            "adx_14": 30.0,
         }
     rows = [{**prev_row} for _ in range(n)]
     rows[-1] = {**last_row}
