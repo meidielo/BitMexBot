@@ -39,10 +39,15 @@ SHORT_RSI_MAX    = 65
 LONG_RSI_MIN     = 35
 LONG_RSI_MAX     = 60
 
+# Strategy 2 — Bollinger Band bounce (mean-reversion)
+BB_RSI_OVERSOLD  = 35      # RSI must be below this for BB LONG
+BB_RSI_OVERBOUGHT = 65     # RSI must be above this for BB SHORT
+
 SL_LOOKBACK      = 5       # candles back for swing high/low SL
 TP_LOOKBACK      = 20      # candles back for extreme-level TP target
 
-REQUIRED_COLS    = ["open", "high", "low", "close", "ema_20", "ema_50", "rsi_14"]
+REQUIRED_COLS    = ["open", "high", "low", "close", "ema_20", "ema_50", "rsi_14",
+                    "bb_upper", "bb_mid", "bb_lower"]
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +496,124 @@ def get_signal(df: pd.DataFrame, exchange=None) -> dict:
             print("  [ML] No model found — skipping filter")
 
         return signal_result
+
+    # ------------------------------------------------------------------
+    # === Strategy 2: Bollinger Band bounce (mean-reversion) ===
+    # ------------------------------------------------------------------
+    bb_upper = float(latest["bb_upper"])
+    bb_mid   = float(latest["bb_mid"])
+    bb_lower = float(latest["bb_lower"])
+    bullish_body = c > o
+    bearish_body = c < o
+
+    # BB LONG: price bounced off lower band
+    bb_l1 = c > bb_lower              # closed back inside bands
+    bb_l2 = lo < bb_lower             # wick pierced below lower band
+    bb_l3 = rsi < BB_RSI_OVERSOLD     # oversold confirmation
+    bb_l4 = bullish_body              # bullish candle confirms bounce
+
+    # BB SHORT: price rejected from upper band
+    bb_s1 = c < bb_upper              # closed back inside bands
+    bb_s2 = h > bb_upper              # wick pierced above upper band
+    bb_s3 = rsi > BB_RSI_OVERBOUGHT   # overbought confirmation
+    bb_s4 = bearish_body              # bearish candle confirms rejection
+
+    print(f"\n  [S2] Bollinger Band bounce:")
+    print(f"  BB upper={bb_upper:.2f}  mid={bb_mid:.2f}  lower={bb_lower:.2f}")
+    print(f"\n  BB SHORT conditions:")
+    print(f"  {_pf(bb_s1)} B1 close inside: close ({c:.2f}) < bb_upper ({bb_upper:.2f})")
+    print(f"  {_pf(bb_s2)} B2 wick pierce:  high ({h:.2f}) > bb_upper ({bb_upper:.2f})")
+    print(f"  {_pf(bb_s3)} B3 overbought:   RSI ({rsi:.2f}) > {BB_RSI_OVERBOUGHT}")
+    print(f"  {_pf(bb_s4)} B4 bearish body: close ({c:.2f}) < open ({o:.2f})")
+    print(f"\n  BB LONG conditions:")
+    print(f"  {_pf(bb_l1)} B1 close inside: close ({c:.2f}) > bb_lower ({bb_lower:.2f})")
+    print(f"  {_pf(bb_l2)} B2 wick pierce:  low ({lo:.2f}) < bb_lower ({bb_lower:.2f})")
+    print(f"  {_pf(bb_l3)} B3 oversold:     RSI ({rsi:.2f}) < {BB_RSI_OVERSOLD}")
+    print(f"  {_pf(bb_l4)} B4 bullish body: close ({c:.2f}) > open ({o:.2f})")
+
+    # --- BB SHORT path ---
+    if bb_s1 and bb_s2 and bb_s3 and bb_s4:
+        sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
+        sl_price = round(sl_raw, 2)
+        sl_dist  = sl_price - entry
+
+        if sl_dist < entry * SL_MIN_DIST_PCT:
+            reason = (f"BB SHORT setup valid but SL too tight: "
+                      f"distance {sl_dist:.2f} < min {SL_MIN_DIST_PCT*100:.1f}%")
+            print(f"\n  [NO_TRADE] {reason}")
+            return _no_trade(reason, funding_rate=funding_rate)
+
+        tp_price = round(bb_mid, 2)
+        gain = entry - tp_price
+        risk = sl_price - entry
+
+        if risk <= 0 or gain <= 0:
+            reason = (f"BB SHORT: TP ({tp_price:.2f}) >= entry ({entry:.2f})")
+            print(f"\n  [NO_TRADE] {reason}")
+            return _no_trade(reason, funding_rate=funding_rate)
+
+        rr = round(gain / risk, 2)
+        if rr < MIN_RR:
+            reason = (f"BB SHORT R:R {rr:.2f} below minimum {MIN_RR} "
+                      f"(entry={entry:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f})")
+            print(f"\n  [NO_TRADE] {reason}")
+            return _no_trade(reason, rr=rr, funding_rate=funding_rate)
+
+        reason = (
+            f"BB SHORT: price rejected upper band (H={h:.2f} > BB_upper={bb_upper:.2f}, "
+            f"C={c:.2f} back inside), RSI={rsi:.2f} overbought, bearish body, "
+            f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
+        )
+        print(f"\n  [S2 SHORT] entry={entry:.2f}  SL={sl_price:.2f}"
+              f"  TP={tp_price:.2f}  R:R={rr:.2f}")
+
+        return {
+            "signal": "SHORT", "reason": reason, "strategy": "bb_bounce",
+            "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
+            "rr": rr, "funding_rate": funding_rate, "ml_score": None,
+        }
+
+    # --- BB LONG path ---
+    if bb_l1 and bb_l2 and bb_l3 and bb_l4:
+        sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
+        sl_price = round(sl_raw, 2)
+        sl_dist  = entry - sl_price
+
+        if sl_dist < entry * SL_MIN_DIST_PCT:
+            reason = (f"BB LONG setup valid but SL too tight: "
+                      f"distance {sl_dist:.2f} < min {SL_MIN_DIST_PCT*100:.1f}%")
+            print(f"\n  [NO_TRADE] {reason}")
+            return _no_trade(reason, funding_rate=funding_rate)
+
+        tp_price = round(bb_mid, 2)
+        gain = tp_price - entry
+        risk = entry - sl_price
+
+        if risk <= 0 or gain <= 0:
+            reason = (f"BB LONG: TP ({tp_price:.2f}) <= entry ({entry:.2f})")
+            print(f"\n  [NO_TRADE] {reason}")
+            return _no_trade(reason, funding_rate=funding_rate)
+
+        rr = round(gain / risk, 2)
+        if rr < MIN_RR:
+            reason = (f"BB LONG R:R {rr:.2f} below minimum {MIN_RR} "
+                      f"(entry={entry:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f})")
+            print(f"\n  [NO_TRADE] {reason}")
+            return _no_trade(reason, rr=rr, funding_rate=funding_rate)
+
+        reason = (
+            f"BB LONG: price bounced off lower band (L={lo:.2f} < BB_lower={bb_lower:.2f}, "
+            f"C={c:.2f} back inside), RSI={rsi:.2f} oversold, bullish body, "
+            f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
+        )
+        print(f"\n  [S2 LONG] entry={entry:.2f}  SL={sl_price:.2f}"
+              f"  TP={tp_price:.2f}  R:R={rr:.2f}")
+
+        return {
+            "signal": "LONG", "reason": reason, "strategy": "bb_bounce",
+            "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
+            "rr": rr, "funding_rate": funding_rate, "ml_score": None,
+        }
 
     # ------------------------------------------------------------------
     # === NO_TRADE — explain failed conditions ===
