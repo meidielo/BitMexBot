@@ -42,6 +42,8 @@ from signals import (
     WICK_MIN_PCT,
     SL_MIN_DIST_PCT,
     TP_ROUND_STEP,
+    BB_RSI_OVERSOLD,
+    BB_RSI_OVERBOUGHT,
 )
 
 # Disable ML filter for unit tests — it would block synthetic signals
@@ -406,6 +408,154 @@ def test_no_trade_when_long_wick_too_small():
 
 
 # ---------------------------------------------------------------------------
+# Synthetic DataFrame factory — BB Bounce
+# ---------------------------------------------------------------------------
+
+# BB LONG: price dips below lower BB, closes back inside, RSI oversold, bullish body
+# We need Strategy 1 (EMA rejection) to NOT fire, so set EMA20 ≈ EMA50 (no trend).
+#
+#   bb_lower = 69000, low = 68900 (pierces below), close = 69200 (back inside)
+#   open = 69050, close = 69200 → bullish body
+#   RSI = 30 < 35 (oversold)
+#   EMA20 = 69500, EMA50 = 69500 → no trend → Strategy 1 won't fire
+#
+#   swing_low5 = 68900  → SL = 68900 - 69.2 = 68830.8
+#   sl_dist = 69200 - 68830.8 = 369.2 > 207.6 (0.3%) → gate PASS
+#   TP = bb_mid = 70000
+#   R:R = 800 / 369.2 ≈ 2.17 ≥ 1.5 → gate PASS
+
+BB_LONG_ROW = {
+    "open":     69050.0,
+    "high":     69300.0,
+    "low":      68900.0,
+    "close":    69200.0,
+    "volume":   1000.0,
+    "ema_20":   69500.0,
+    "ema_50":   69500.0,   # no trend — Strategy 1 won't fire
+    "rsi_14":   30.0,      # oversold
+    "bb_upper": 71000.0,
+    "bb_mid":   70000.0,
+    "bb_lower": 69000.0,
+}
+
+# BB SHORT: price spikes above upper BB, closes back inside, RSI overbought, bearish body
+#
+#   bb_upper = 71000, high = 71200 (pierces above), close = 70800 (back inside)
+#   open = 71100, close = 70800 → bearish body
+#   RSI = 70 > 65 (overbought)
+#
+#   swing_high5 = 71200  → SL = 71200 + 70.8 = 71270.8
+#   sl_dist = 71270.8 - 70800 = 470.8 > 212.4 (0.3%) → gate PASS
+#   TP = bb_mid = 70000
+#   R:R = 800 / 470.8 ≈ 1.70 ≥ 1.5 → gate PASS
+
+BB_SHORT_ROW = {
+    "open":     71100.0,
+    "high":     71200.0,
+    "low":      70700.0,
+    "close":    70800.0,
+    "volume":   1000.0,
+    "ema_20":   70500.0,
+    "ema_50":   70500.0,   # no trend
+    "rsi_14":   70.0,      # overbought
+    "bb_upper": 71000.0,
+    "bb_mid":   70000.0,
+    "bb_lower": 69000.0,
+}
+
+
+def _df_bb(base_row: dict, n: int = 60, **last_overrides) -> pd.DataFrame:
+    """Build a synthetic DataFrame for BB bounce tests."""
+    rows = [{**base_row} for _ in range(n)]
+    rows[-1].update(last_overrides)
+    idx = pd.date_range("2026-01-01", periods=n, freq="15min")
+    return pd.DataFrame(rows, index=idx)
+
+
+# ---------------------------------------------------------------------------
+# Test 13 — BB LONG fires when all conditions met
+# ---------------------------------------------------------------------------
+
+def test_bb_long_fires():
+    with _silent():
+        result = get_signal(_df_bb(BB_LONG_ROW))
+
+    assert result["signal"] == "LONG", (
+        f"Expected BB LONG, got {result['signal']}. Reason: {result['reason']}"
+    )
+    assert "BB LONG" in result["reason"], (
+        f"Reason should mention BB LONG, got: {result['reason']}"
+    )
+    assert result["rr"] >= MIN_RR
+    print("[PASS] test_bb_long_fires")
+
+
+# ---------------------------------------------------------------------------
+# Test 14 — BB SHORT fires when all conditions met
+# ---------------------------------------------------------------------------
+
+def test_bb_short_fires():
+    with _silent():
+        result = get_signal(_df_bb(BB_SHORT_ROW))
+
+    assert result["signal"] == "SHORT", (
+        f"Expected BB SHORT, got {result['signal']}. Reason: {result['reason']}"
+    )
+    assert "BB SHORT" in result["reason"], (
+        f"Reason should mention BB SHORT, got: {result['reason']}"
+    )
+    assert result["rr"] >= MIN_RR
+    print("[PASS] test_bb_short_fires")
+
+
+# ---------------------------------------------------------------------------
+# Test 15 — BB LONG NO_TRADE when RSI not oversold
+# ---------------------------------------------------------------------------
+
+def test_bb_long_no_trade_rsi_not_oversold():
+    with _silent():
+        result = get_signal(_df_bb(BB_LONG_ROW, rsi_14=50.0))
+
+    assert result["signal"] == "NO_TRADE", (
+        f"Expected NO_TRADE (RSI not oversold), got {result['signal']}"
+    )
+    print("[PASS] test_bb_long_no_trade_rsi_not_oversold")
+
+
+# ---------------------------------------------------------------------------
+# Test 16 — BB SHORT NO_TRADE when RSI not overbought
+# ---------------------------------------------------------------------------
+
+def test_bb_short_no_trade_rsi_not_overbought():
+    with _silent():
+        result = get_signal(_df_bb(BB_SHORT_ROW, rsi_14=50.0))
+
+    assert result["signal"] == "NO_TRADE", (
+        f"Expected NO_TRADE (RSI not overbought), got {result['signal']}"
+    )
+    print("[PASS] test_bb_short_no_trade_rsi_not_overbought")
+
+
+# ---------------------------------------------------------------------------
+# Test 17 — Strategy 1 takes priority over Strategy 2
+# ---------------------------------------------------------------------------
+
+def test_strategy_1_priority_over_bb():
+    """When EMA rejection (S1) fires, BB bounce (S2) should not be reached."""
+    with _silent():
+        result = get_signal(_df())  # default _df fires SHORT via Strategy 1
+
+    assert result["signal"] == "SHORT", (
+        f"Expected SHORT from S1, got {result['signal']}"
+    )
+    # Strategy 1 reason mentions EMA/rejection, not BB
+    assert "BB" not in result["reason"], (
+        f"S1 should fire before S2, but reason mentions BB: {result['reason']}"
+    )
+    print("[PASS] test_strategy_1_priority_over_bb")
+
+
+# ---------------------------------------------------------------------------
 # Bonus — helper unit tests (nearest_round_support/resistance)
 # ---------------------------------------------------------------------------
 
@@ -437,6 +587,11 @@ def run_all():
         test_tp_above_entry_for_long,
         test_no_trade_when_long_trend_too_young,
         test_no_trade_when_long_wick_too_small,
+        test_bb_long_fires,
+        test_bb_short_fires,
+        test_bb_long_no_trade_rsi_not_oversold,
+        test_bb_short_no_trade_rsi_not_overbought,
+        test_strategy_1_priority_over_bb,
     ]
 
     print(f"Running {len(tests)} signal tests...\n")
