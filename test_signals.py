@@ -44,6 +44,9 @@ from signals import (
     TP_ROUND_STEP,
     BB_RSI_OVERSOLD,
     BB_RSI_OVERBOUGHT,
+    EMA_CROSS_BODY_MIN_PCT,
+    RSI_EXTREME_LOW,
+    RSI_EXTREME_HIGH,
 )
 
 # Disable ML filter for unit tests — it would block synthetic signals
@@ -556,6 +559,204 @@ def test_strategy_1_priority_over_bb():
 
 
 # ---------------------------------------------------------------------------
+# Synthetic DataFrame factory — EMA Crossover (S3)
+# ---------------------------------------------------------------------------
+
+# EMA Cross LONG: prev candle EMA20 <= EMA50, current EMA20 > EMA50, bullish body
+# No S1 or S2 should fire: no rejection candle, no BB touch.
+#
+# Previous candle: EMA20=69500, EMA50=69500 (equal — no trend for S1)
+# Current candle:  EMA20=69600, EMA50=69500 (just crossed above)
+# Bullish body: open=69300, close=69600 (body=0.43%)
+# Low stays above EMA20 → no S1 rejection
+# BB bounds far away → no S2
+
+EMA_CROSS_LONG_ROW = {
+    "open":     69300.0,
+    "high":     69700.0,
+    "low":      69200.0,
+    "close":    69600.0,
+    "volume":   1000.0,
+    "ema_20":   69600.0,
+    "ema_50":   69500.0,    # EMA20 just crossed above
+    "rsi_14":   55.0,       # neutral
+    "bb_upper": 72000.0,
+    "bb_mid":   70000.0,
+    "bb_lower": 67000.0,    # far from price
+}
+
+EMA_CROSS_LONG_PREV = {
+    "open":     69200.0,
+    "high":     73000.0,    # high enough for 20-bar TP (R:R needs this)
+    "low":      69100.0,    # tight SL for good R:R
+    "close":    69300.0,
+    "volume":   1000.0,
+    "ema_20":   69500.0,
+    "ema_50":   69500.0,    # equal — not crossed yet
+    "rsi_14":   50.0,
+    "bb_upper": 72000.0,
+    "bb_mid":   70000.0,
+    "bb_lower": 67000.0,
+}
+
+
+def _df_ema_cross(direction: str = "LONG", n: int = 60) -> pd.DataFrame:
+    """Build DataFrame where EMA crossover fires."""
+    if direction == "LONG":
+        last_row = EMA_CROSS_LONG_ROW
+        prev_row = EMA_CROSS_LONG_PREV
+    else:
+        # SHORT: mirror — EMA20 crosses below EMA50
+        last_row = {
+            "open": 69700.0, "high": 69800.0, "low": 69200.0, "close": 69300.0,
+            "volume": 1000.0,
+            "ema_20": 69400.0, "ema_50": 69500.0,  # EMA20 just crossed below
+            "rsi_14": 45.0, "bb_upper": 72000.0, "bb_mid": 70000.0, "bb_lower": 67000.0,
+        }
+        prev_row = {
+            "open": 69600.0, "high": 69800.0, "low": 66000.0, "close": 69500.0,
+            "volume": 1000.0,
+            "ema_20": 69500.0, "ema_50": 69500.0,  # equal
+            "rsi_14": 50.0, "bb_upper": 72000.0, "bb_mid": 70000.0, "bb_lower": 67000.0,
+        }
+    rows = [{**prev_row} for _ in range(n)]
+    rows[-1] = {**last_row}
+    idx = pd.date_range("2026-01-01", periods=n, freq="15min")
+    return pd.DataFrame(rows, index=idx)
+
+
+# ---------------------------------------------------------------------------
+# Test 18 — EMA Cross LONG fires
+# ---------------------------------------------------------------------------
+
+def test_ema_cross_long_fires():
+    with _silent():
+        result = get_signal(_df_ema_cross("LONG"))
+
+    assert result["signal"] == "LONG", (
+        f"Expected EMA Cross LONG, got {result['signal']}. Reason: {result['reason']}"
+    )
+    assert "EMA Cross" in result["reason"], (
+        f"Reason should mention EMA Cross, got: {result['reason']}"
+    )
+    print("[PASS] test_ema_cross_long_fires")
+
+
+# ---------------------------------------------------------------------------
+# Test 19 — EMA Cross SHORT fires
+# ---------------------------------------------------------------------------
+
+def test_ema_cross_short_fires():
+    with _silent():
+        result = get_signal(_df_ema_cross("SHORT"))
+
+    assert result["signal"] == "SHORT", (
+        f"Expected EMA Cross SHORT, got {result['signal']}. Reason: {result['reason']}"
+    )
+    assert "EMA Cross" in result["reason"], (
+        f"Reason should mention EMA Cross, got: {result['reason']}"
+    )
+    print("[PASS] test_ema_cross_short_fires")
+
+
+# ---------------------------------------------------------------------------
+# Synthetic DataFrame factory — RSI Reversal (S4)
+# ---------------------------------------------------------------------------
+
+# RSI Reversal LONG: prev RSI < 30, current RSI >= 30, bullish body
+# No S1/S2/S3 should fire: no trend, no BB touch, no crossover
+
+RSI_REV_LONG_ROW = {
+    "open":     69100.0,
+    "high":     69500.0,
+    "low":      69000.0,
+    "close":    69400.0,
+    "volume":   1000.0,
+    "ema_20":   69500.0,
+    "ema_50":   69500.0,    # no trend
+    "rsi_14":   32.0,       # just exited oversold (was < 30)
+    "bb_upper": 72000.0,
+    "bb_mid":   70500.0,    # TP target — above entry for LONG
+    "bb_lower": 67000.0,    # far from price
+}
+
+RSI_REV_LONG_PREV = {
+    "open":     69200.0,
+    "high":     69300.0,
+    "low":      69000.0,    # tight SL for good R:R
+    "close":    69100.0,
+    "volume":   1000.0,
+    "ema_20":   69500.0,
+    "ema_50":   69500.0,
+    "rsi_14":   28.0,       # was oversold
+    "bb_upper": 72000.0,
+    "bb_mid":   70500.0,    # TP = bb_mid = 70500 (above entry 69400)
+    "bb_lower": 67000.0,
+}
+
+
+def _df_rsi_rev(direction: str = "LONG", n: int = 60) -> pd.DataFrame:
+    """Build DataFrame where RSI reversal fires."""
+    if direction == "LONG":
+        last_row = RSI_REV_LONG_ROW
+        prev_row = RSI_REV_LONG_PREV
+    else:
+        # SHORT: prev RSI > 70, now <= 70, bearish body
+        last_row = {
+            "open": 69600.0, "high": 69700.0, "low": 69100.0, "close": 69200.0,
+            "volume": 1000.0,
+            "ema_20": 69500.0, "ema_50": 69500.0,
+            "rsi_14": 68.0,  # just exited overbought
+            "bb_upper": 72000.0, "bb_mid": 68000.0, "bb_lower": 67000.0,
+        }
+        prev_row = {
+            "open": 69500.0, "high": 69800.0, "low": 69400.0, "close": 69600.0,
+            "volume": 1000.0,
+            "ema_20": 69500.0, "ema_50": 69500.0,
+            "rsi_14": 72.0,  # was overbought
+            "bb_upper": 72000.0, "bb_mid": 68000.0, "bb_lower": 67000.0,
+        }
+    rows = [{**prev_row} for _ in range(n)]
+    rows[-1] = {**last_row}
+    idx = pd.date_range("2026-01-01", periods=n, freq="15min")
+    return pd.DataFrame(rows, index=idx)
+
+
+# ---------------------------------------------------------------------------
+# Test 20 — RSI Reversal LONG fires
+# ---------------------------------------------------------------------------
+
+def test_rsi_reversal_long_fires():
+    with _silent():
+        result = get_signal(_df_rsi_rev("LONG"))
+
+    assert result["signal"] == "LONG", (
+        f"Expected RSI Reversal LONG, got {result['signal']}. Reason: {result['reason']}"
+    )
+    assert "RSI Reversal" in result["reason"], (
+        f"Reason should mention RSI Reversal, got: {result['reason']}"
+    )
+    print("[PASS] test_rsi_reversal_long_fires")
+
+
+# ---------------------------------------------------------------------------
+# Test 21 — RSI Reversal SHORT fires
+# ---------------------------------------------------------------------------
+
+def test_rsi_reversal_short_fires():
+    with _silent():
+        result = get_signal(_df_rsi_rev("SHORT"))
+
+    assert result["signal"] == "SHORT", (
+        f"Expected RSI Reversal SHORT, got {result['signal']}. Reason: {result['reason']}"
+    )
+    assert "RSI Reversal" in result["reason"], (
+        f"Reason should mention RSI Reversal, got: {result['reason']}"
+    )
+    print("[PASS] test_rsi_reversal_short_fires")
+
+
+# ---------------------------------------------------------------------------
 # Bonus — helper unit tests (nearest_round_support/resistance)
 # ---------------------------------------------------------------------------
 
@@ -592,6 +793,10 @@ def run_all():
         test_bb_long_no_trade_rsi_not_oversold,
         test_bb_short_no_trade_rsi_not_overbought,
         test_strategy_1_priority_over_bb,
+        test_ema_cross_long_fires,
+        test_ema_cross_short_fires,
+        test_rsi_reversal_long_fires,
+        test_rsi_reversal_short_fires,
     ]
 
     print(f"Running {len(tests)} signal tests...\n")
