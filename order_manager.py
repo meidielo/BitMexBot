@@ -288,64 +288,56 @@ def execute_signal(signal: dict, validated_risk: dict) -> dict:
         pass
 
     # ------------------------------------------------------------------
-    # Fetch live orderbook price for entry
-    # SHORT → ask (sell into buyers);  LONG → bid (buy from sellers)
-    # This replaces the signal close price so the limit fills immediately.
+    # Apply tick rounding to SL/TP before any order is placed.
     # ------------------------------------------------------------------
-    entry_price = _fetch_entry_price(
-        exchange, sig, fallback=float(signal["entry_price"])
-    )
-
-    # ------------------------------------------------------------------
-    # Apply tick rounding as the LAST STEP before any order is placed.
-    # Done here — after the live price is known — not at signal unpack time.
-    # ------------------------------------------------------------------
-    entry_price = round_to_tick(entry_price)
     sl_price    = round_to_tick(sl_price)
     tp_price    = round_to_tick(tp_price)
-    print(f"[PRICES] entry={entry_price} sl={sl_price} tp={tp_price}")
 
     entry_order = None
     sl_order    = None
     tp_order    = None
 
     # ------------------------------------------------------------------
-    # Step 1 — Limit entry order
+    # Step 1 — Market entry order
+    # Testnet has near-zero liquidity, so limit orders rarely fill.
+    # Market orders fill instantly against the testnet matching engine.
     # ------------------------------------------------------------------
     try:
         entry_order = exchange.create_order(
             symbol=SYMBOL,
-            type="limit",
+            type="market",
             side=entry_side,
             amount=amount,
-            price=entry_price,
-            params={"timeInForce": "GoodTillCancel"},
         )
         print(
-            f"[ORDER] {sig} limit entry placed  "
+            f"[ORDER] {sig} market entry placed  "
             f"| ID: {entry_order['id']}"
-            f"  Size: {amount} contracts @ {entry_price}"
+            f"  Size: {amount} contracts"
         )
     except Exception as e:
         return _result("failed", error=f"Entry order placement failed: {e}")
 
-    # ------------------------------------------------------------------
-    # Step 2 — Wait for fill
-    # ------------------------------------------------------------------
-    filled_order = _poll_for_fill(exchange, entry_order["id"])
-    if filled_order is None:
-        _cancel_all(exchange)
-        return _result(
-            "failed",
-            entry_order=entry_order,
-            error=(
-                f"Entry order {entry_order['id']} did not fill within "
-                f"{FILL_TIMEOUT}s — cancelled and aborted."
-            ),
-        )
+    # Market orders fill immediately — fetch the final order state.
+    try:
+        filled_order = exchange.fetch_order(entry_order["id"], SYMBOL)
+    except Exception:
+        filled_order = entry_order
+
+    if filled_order.get("status") not in ("closed", None):
+        # Unexpected — market orders should fill instantly
+        print(f"[WARN] Market order status: {filled_order.get('status')}. Waiting briefly...")
+        filled_order = _poll_for_fill(exchange, entry_order["id"])
+        if filled_order is None:
+            _cancel_all(exchange)
+            return _result(
+                "failed",
+                entry_order=entry_order,
+                error=f"Market entry did not fill — cancelled.",
+            )
 
     # Use the actual average fill price for SL/TP if available.
-    fill_price = float(filled_order.get("average") or entry_price)
+    fill_price = float(filled_order.get("average") or float(signal["entry_price"]))
+    print(f"[PRICES] fill={fill_price} sl={sl_price} tp={tp_price}")
     print(f"[FILL]  Entry filled @ avg {fill_price:.2f}")
 
     # ------------------------------------------------------------------
