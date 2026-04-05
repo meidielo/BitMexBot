@@ -64,7 +64,7 @@ def _result(status: str, entry_order=None, sl_order=None,
     }
 
 
-def round_to_tick(price: float, tick: float = 0.5) -> float:
+def round_to_tick(price: float, tick: float = 0.1) -> float:
     """
     Round price to the nearest tick increment.
     Uses round(..., 2) to eliminate floating-point representation artefacts
@@ -355,8 +355,7 @@ def execute_signal(signal: dict, validated_risk: dict) -> dict:
             type="stop",
             side=close_side,
             amount=amount,
-            price=_sl,
-            params={"execInst": "Close"},
+            params={"stopPx": _sl, "execInst": "Close"},
         )
         print(
             f"[ORDER] SL stop-market placed      "
