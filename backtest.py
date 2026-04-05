@@ -357,6 +357,7 @@ def run_backtest(df: pd.DataFrame) -> list:
             continue
 
         # Capture analysis fields at signal time (candle i)
+        strategy          = sig_result.get("strategy", "ema_rejection")
         rsi_at_entry      = round(float(df.iloc[i]["rsi_14"]), 2)
         ema_trend_candles = _count_ema_trend_candles(df, i, direction)
 
@@ -421,6 +422,7 @@ def run_backtest(df: pd.DataFrame) -> list:
 
         trade = {
             "trade_num":          len(trades) + 1,
+            "strategy":           strategy,
             "entry_ts":           fill_ts.strftime("%Y-%m-%d %H:%M UTC"),
             "exit_ts":            exit_ts.strftime("%Y-%m-%d %H:%M UTC"),
             "direction":          direction,
@@ -443,9 +445,10 @@ def run_backtest(df: pd.DataFrame) -> list:
 
         # One-line progress per trade
         tag = " WIN" if outcome == "TP" else ("LOSS" if outcome == "SL" else "OPEN")
+        strat_tag = strategy[:8].ljust(8)
         print(
             f"  [{len(trades):4d}] {fill_ts.strftime('%Y-%m-%d %H:%M')} "
-            f"{direction:5s} {tag}  "
+            f"{strat_tag} {direction:5s} {tag}  "
             f"R={r_multiple:+.2f}  PnL=${pnl_usd:+7.2f}  "
             f"Bal=${balance:>9,.2f}"
         )
@@ -516,6 +519,28 @@ def print_report(trades: list) -> None:
     print(f"  Avg R achieved: {avg_r:>+.2f}R")
     print(f"  Avg duration  : {avg_dur:.0f} min  ({avg_dur / 60:.1f} h)")
     print("=" * w)
+
+    # Per-strategy breakdown
+    strategies = sorted(set(t.get("strategy", "ema_rejection") for t in trades))
+    if len(strategies) > 1 or strategies[0] != "ema_rejection":
+        print()
+        print("-" * w)
+        print("  PER-STRATEGY BREAKDOWN")
+        print("-" * w)
+        print(f"  {'Strategy':<16} {'Trades':>7} {'Wins':>6} {'WR%':>6} {'PF':>6} {'Avg R':>7} {'PnL':>10}")
+        print("-" * w)
+        for strat in strategies:
+            st = [t for t in trades if t.get("strategy", "ema_rejection") == strat]
+            sw = [t for t in st if t["outcome"] == "TP"]
+            sl = [t for t in st if t["outcome"] == "SL"]
+            s_wr = len(sw) / len(st) * 100 if st else 0
+            s_pnl = sum(t["pnl_usd"] for t in st)
+            s_avg_r = sum(t["actual_r"] for t in st) / len(st) if st else 0
+            gp = sum(t["pnl_usd"] for t in sw) if sw else 0
+            gl = abs(sum(t["pnl_usd"] for t in sl)) if sl else 0
+            s_pf = gp / gl if gl > 0 else float("inf")
+            print(f"  {strat:<16} {len(st):>7} {len(sw):>6} {s_wr:>5.1f}% {s_pf:>5.2f} {s_avg_r:>+6.2f}R ${s_pnl:>+9.2f}")
+        print("-" * w)
 
 
 # ---------------------------------------------------------------------------

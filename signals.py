@@ -29,7 +29,7 @@ FUNDING_SYMBOL   = "BTC/USDT:USDT"
 
 WICK_MIN_PCT     = 0.0005  # 0.05% — lowered to generate trades on testnet
 SL_BUFFER_PCT    = 0.001   # 0.1% buffer beyond swing high/low
-SL_MIN_DIST_PCT  = 0.003   # 0.3% — if SL is closer than this, skip (noise)
+SL_MIN_DIST_PCT  = 0.0015  # 0.15% — if SL is closer than this, skip (noise)
 MIN_RR           = 1.5     # minimum reward-to-risk ratio
 MIN_TREND_AGE    = 15      # consecutive candles in trend required for entry
 TP_ROUND_STEP    = 500     # round-number level spacing for TP targets
@@ -40,8 +40,8 @@ LONG_RSI_MIN     = 35
 LONG_RSI_MAX     = 60
 
 # Strategy 2 — Bollinger Band bounce (mean-reversion)
-BB_RSI_OVERSOLD  = 35      # RSI must be below this for BB LONG
-BB_RSI_OVERBOUGHT = 65     # RSI must be above this for BB SHORT
+BB_RSI_OVERSOLD  = 38      # RSI must be below this for BB LONG
+BB_RSI_OVERBOUGHT = 62     # RSI must be above this for BB SHORT
 
 # Strategy 3 — EMA crossover (trend change entry)
 EMA_CROSS_BODY_MIN_PCT = 0.001  # candle body must be >= 0.1% of close (conviction)
@@ -51,7 +51,7 @@ RSI_EXTREME_LOW  = 30      # RSI was below this, now above → LONG
 RSI_EXTREME_HIGH = 70      # RSI was above this, now below → SHORT
 
 # ADX filter — applied to S3 and S4 to avoid whipsaws in choppy markets
-ADX_MIN          = 25      # ADX must be >= 25 to confirm trend strength
+ADX_MIN          = 20      # ADX must be >= 20 to confirm trend strength
 
 SL_LOOKBACK      = 5       # candles back for swing high/low SL
 TP_LOOKBACK      = 20      # candles back for extreme-level TP target
