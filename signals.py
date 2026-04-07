@@ -1,903 +1,356 @@
 """
-signals.py — Phase 3 (rewritten)
+signals.py — V2: Funding Rate Mean Reversion
 
-Real strategy: EMA-rejection candles with wick confirmation, RSI filter,
-swing-high/low SL, and round-number / recent-extreme TP targets.
+Edge: When perpetual swap funding is extreme, the market is asymmetrically
+positioned. High positive funding = over-leveraged longs paying shorts.
+A small adverse move triggers cascading liquidations → violent mean reversion.
 
-Function signature is backward-compatible:
-    get_signal(df, exchange=None) -> dict
+Strategy:
+  SETUP  — Funding rate exceeds a threshold (structural leverage imbalance)
+  TIME   — Candle falls within settlement proximity window (00/08/16 UTC)
+  TRIGGER — 15m price action confirms the squeeze has started
 
-The exchange argument is optional.  When supplied, the current
-funding rate is fetched and added to the reason string as
-confirmation (never blocks a signal).
+Setup:
+  funding_rate > +FUNDING_THRESHOLD  → SHORT setup (longs over-leveraged)
+  funding_rate < -FUNDING_THRESHOLD  → LONG setup  (shorts over-leveraged)
+
+Time filter:
+  Trades only fire within SETTLEMENT_WINDOW_H hours before each 8h settlement.
+  This is when over-leveraged traders close to avoid paying, and when
+  liquidation cascades cluster. Outside this window, the structural mechanic
+  that drives mean reversion is dormant.
+
+Trigger (must occur while setup + time filter are active):
+  SHORT trigger: 15m candle closes below previous candle's low + volume spike
+  LONG trigger:  15m candle closes above previous candle's high + volume spike
+
+Exit:
+  Fixed R:R target (aggressive — mean reversion is violent and fast).
+  SL placed at recent swing high/low.
+
+This module has NO lagging indicators. It trades a structural market mechanic.
 """
 
-import math
 import pandas as pd
 
-# ML filter — optional, loaded lazily; absence is not an error
-try:
-    from ml_filter import score_signal as _ml_score_signal
-    _ML_AVAILABLE = True
-except ImportError:
-    _ML_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
-# Strategy constants  (never overridden)
+# Strategy constants
 # ---------------------------------------------------------------------------
-FUNDING_SYMBOL   = "BTC/USDT:USDT"
 
-WICK_MIN_PCT     = 0.0005  # 0.05% — lowered to generate trades on testnet
-SL_BUFFER_PCT    = 0.001   # 0.1% buffer beyond swing high/low
-SL_MIN_DIST_PCT  = 0.0015  # 0.15% — if SL is closer than this, skip (noise)
-MIN_RR           = 1.5     # minimum reward-to-risk ratio
-MIN_TREND_AGE    = 15      # consecutive candles in trend required for entry
-TP_ROUND_STEP    = 500     # round-number level spacing for TP targets
+# Funding threshold — 0.05% per 8h = 0.15%/day annualized ~55%.
+# This is extreme. Normal funding oscillates around 0.01%.
+FUNDING_THRESHOLD   = 0.0005   # 0.05% — setup activates above this
 
-SHORT_RSI_MIN    = 40      # display only — RSI is no longer a signal gate
-SHORT_RSI_MAX    = 65
-LONG_RSI_MIN     = 35
-LONG_RSI_MAX     = 60
+# Cumulative 24h funding threshold (sum of last 3 × 8h rates).
+# Persistent extreme funding is a stronger signal than a single spike.
+FUNDING_24H_THRESH  = 0.001    # 0.10% cumulative over 24h
 
-# Strategy 2 — Bollinger Band bounce (mean-reversion)
-BB_RSI_OVERSOLD  = 38      # RSI must be below this for BB LONG
-BB_RSI_OVERBOUGHT = 62     # RSI must be above this for BB SHORT
+# Volume spike: current candle volume must be >= this multiple of
+# the rolling 20-candle average volume. Confirms participation.
+VOLUME_SPIKE_MULT   = 1.5
 
-# Strategy 3 — EMA crossover (trend change entry)
-EMA_CROSS_BODY_MIN_PCT = 0.001  # candle body must be >= 0.1% of close (conviction)
+# Price breakdown: candle must close beyond prev candle's range.
+# No additional buffer — the close itself is the confirmation.
 
-# Strategy 4 — RSI reversal (extreme exit)
-RSI_EXTREME_LOW  = 30      # RSI was below this, now above → LONG
-RSI_EXTREME_HIGH = 70      # RSI was above this, now below → SHORT
+# Risk parameters
+SL_LOOKBACK         = 5        # candles back for swing high/low SL
+SL_BUFFER_PCT       = 0.001    # 0.1% buffer beyond swing point
+SL_MIN_DIST_PCT     = 0.0015   # 0.15% minimum SL distance (noise filter)
+TARGET_RR           = 1.5      # fixed reward:risk ratio for TP
+MIN_RR              = 1.0      # minimum acceptable R:R
 
-# ADX filter — applied to S3 and S4 to avoid whipsaws in choppy markets
-ADX_MIN          = 20      # ADX must be >= 20 to confirm trend strength
+# Settlement time proximity filter
+# BitMEX funding settles at 00:00, 08:00, 16:00 UTC.
+# Over-leveraged traders close BEFORE settlement to avoid paying.
+# Liquidation cascades cluster around settlement.
+# Only trade within this window before each settlement.
+SETTLEMENT_HOURS    = [0, 8, 16]       # UTC hours when funding settles
+SETTLEMENT_WINDOW_H = 3                # hours before settlement to allow trades
+USE_SETTLEMENT_FILTER = True           # structural rule — do not toggle based on small samples
 
-SL_LOOKBACK      = 5       # candles back for swing high/low SL
-TP_LOOKBACK      = 20      # candles back for extreme-level TP target
-
-REQUIRED_COLS    = ["open", "high", "low", "close", "ema_20", "ema_50", "rsi_14",
-                    "bb_upper", "bb_mid", "bb_lower", "adx_14"]
+# Volume lookback for the rolling average
+VOLUME_LOOKBACK     = 20
 
 
 # ---------------------------------------------------------------------------
-# TP level helpers
+# Settlement proximity check
 # ---------------------------------------------------------------------------
 
-def nearest_round_support(price: float, step: int = TP_ROUND_STEP) -> float:
-    """Largest multiple of `step` that is <= price."""
-    return math.floor(price / step) * step
-
-
-def nearest_round_resistance(price: float, step: int = TP_ROUND_STEP) -> float:
-    """Smallest multiple of `step` that is >= price."""
-    return math.ceil(price / step) * step
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _no_trade(reason: str, rr: float = None,
-              funding_rate: float = None) -> dict:
-    return {
-        "signal":       "NO_TRADE",
-        "reason":       reason,
-        "entry_price":  None,
-        "sl_price":     None,
-        "tp_price":     None,
-        "rr":           rr,
-        "funding_rate": funding_rate,
-    }
-
-
-def _fetch_funding_rate(exchange) -> "float | None":
+def _in_settlement_window(timestamp: pd.Timestamp) -> bool:
     """
-    Fetch the current XBTUSDT funding rate from the exchange.
-    Returns None on any failure — funding rate is confirmation only,
-    never a blocker.
+    Returns True if the candle timestamp falls within SETTLEMENT_WINDOW_H
+    hours before any funding settlement time (00:00, 08:00, 16:00 UTC).
+
+    Example with SETTLEMENT_WINDOW_H=3:
+      08:00 settlement → window is 05:00–08:00
+      16:00 settlement → window is 13:00–16:00
+      00:00 settlement → window is 21:00–00:00
     """
-    if exchange is None:
-        return None
-    try:
-        data = exchange.fetch_funding_rate(FUNDING_SYMBOL)
-        return float(data.get("fundingRate", 0.0))
-    except Exception as exc:
-        print(f"  [WARN] Could not fetch funding rate: {exc}")
-        return None
+    hour = timestamp.hour
+    minute = timestamp.minute
+    candle_minutes = hour * 60 + minute
 
+    for settle_h in SETTLEMENT_HOURS:
+        settle_minutes = settle_h * 60
+        window_start = (settle_minutes - SETTLEMENT_WINDOW_H * 60) % (24 * 60)
 
-def _pf(passed: bool) -> str:
-    """'[PASS]' or '[FAIL]' label for terminal diagnostics."""
-    return "[PASS]" if passed else "[FAIL]"
-
-
-def _count_trend_age(df: pd.DataFrame, direction: str = "SHORT") -> int:
-    """
-    Count consecutive candles going backwards from the last row where
-    the trend condition holds:
-        SHORT: EMA20 < EMA50 (downtrend)
-        LONG:  EMA20 > EMA50 (uptrend)
-
-    Stops as soon as the condition breaks or a NaN is hit.
-    Returns 0 if the condition does not hold on the last candle itself.
-    """
-    count = 0
-    for k in range(len(df) - 1, -1, -1):
-        row = df.iloc[k]
-        e20 = row["ema_20"]
-        e50 = row["ema_50"]
-        if pd.isna(e20) or pd.isna(e50):
-            break
-        if direction == "SHORT" and float(e20) < float(e50):
-            count += 1
-        elif direction == "LONG" and float(e20) > float(e50):
-            count += 1
+        if window_start < settle_minutes:
+            # Normal case: window doesn't wrap midnight
+            if window_start <= candle_minutes < settle_minutes:
+                return True
         else:
-            break
-    return count
+            # Wraps midnight (e.g., 21:00–00:00)
+            if candle_minutes >= window_start or candle_minutes < settle_minutes:
+                return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
-# Main signal function
+# Public API
 # ---------------------------------------------------------------------------
 
-def get_signal(df: pd.DataFrame, exchange=None) -> dict:
+def get_signal(df: pd.DataFrame, current_funding: dict = None) -> dict:
     """
-    Evaluate the latest candle in an enriched OHLCV+indicator DataFrame.
+    Evaluate funding rate mean reversion signal.
+
+    Parameters
+    ----------
+    df : DataFrame
+        15m OHLCV with columns: open, high, low, close, volume.
+        If 'funding_rate' and 'funding_24h' columns exist (from merge_funding),
+        they are used directly. Otherwise, current_funding dict is used.
+
+    current_funding : dict, optional
+        Live funding data: {"rate": float, "funding_24h": float}.
+        Used when df doesn't contain merged funding columns.
 
     Returns
     -------
-    dict with keys:
-        signal       : "LONG" | "SHORT" | "NO_TRADE"
-        reason       : plain-English explanation of every condition
-        entry_price  : float | None
-        sl_price     : float | None
-        tp_price     : float | None
-        rr           : float | None
-        funding_rate : float | None
-
-    SHORT conditions (all required)
-    --------------------------------
-    C1  Trend     : EMA20 < EMA50
-    C2  Trend age : >= MIN_TREND_AGE (20) consecutive candles in downtrend
-    C3  Rejection : high > EMA20  AND  close < EMA20
-    C4  Wick      : upper_wick  = high - max(open, close) > 0.2% of close
-
-    LONG conditions (all required)
-    --------------------------------
-    C1  Trend     : EMA20 > EMA50
-    C2  Trend age : >= MIN_TREND_AGE (20) consecutive candles in uptrend
-    C3  Rejection : low < EMA20  AND  close > EMA20
-    C4  Wick      : lower_wick  = min(open, close) - low > 0.2% of close
-
-    SL  = swing high/low of last 5 candles ± 0.1% buffer
-    TP  = min/max of (20-bar extreme, nearest round level)
-    Gate: SL distance < 0.3% → NO_TRADE; R:R < 2.0 → NO_TRADE
+    dict with keys: signal, reason, entry_price, sl_price, tp_price, rr,
+                    funding_rate, funding_24h
     """
+    no_trade = lambda reason: {
+        "signal": "NO_TRADE", "reason": reason,
+        "entry_price": 0, "sl_price": 0, "tp_price": 0,
+        "rr": 0, "funding_rate": None, "funding_24h": None,
+    }
+
+    if len(df) < max(SL_LOOKBACK, VOLUME_LOOKBACK) + 2:
+        return no_trade(f"Insufficient data: {len(df)} candles (need {VOLUME_LOOKBACK + 2})")
 
     # ------------------------------------------------------------------
-    # Guards
+    # Extract latest candle and previous candle
     # ------------------------------------------------------------------
-    if df is None or df.empty:
-        return _no_trade("DataFrame is empty or None.")
+    curr = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        return _no_trade(f"Missing required columns: {missing}")
+    close   = float(curr["close"])
+    opn     = float(curr["open"])
+    high    = float(curr["high"])
+    low     = float(curr["low"])
+    vol     = float(curr["volume"])
 
-    if len(df) < SL_LOOKBACK:
-        return _no_trade(
-            f"Insufficient data: need >= {SL_LOOKBACK} candles, got {len(df)}."
-        )
-
-    latest = df.iloc[-1]
-    ts     = df.index[-1]
-
-    nan_cols = [c for c in REQUIRED_COLS if pd.isna(latest[c])]
-    if nan_cols:
-        return _no_trade(
-            f"Indicators not warmed up at {ts}. NaN in: {nan_cols}"
-        )
+    prev_high = float(prev["high"])
+    prev_low  = float(prev["low"])
 
     # ------------------------------------------------------------------
-    # Extract values
+    # Get funding rate
     # ------------------------------------------------------------------
-    o     = float(latest["open"])
-    h     = float(latest["high"])
-    lo    = float(latest["low"])
-    c     = float(latest["close"])
-    ema20 = float(latest["ema_20"])
-    ema50 = float(latest["ema_50"])
-    rsi   = float(latest["rsi_14"])
-
-    entry = c   # entry is always current close
-
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - lo
-
-    last_5      = df.iloc[-SL_LOOKBACK:]
-    last_20     = df.iloc[-TP_LOOKBACK:]
-    swing_high5 = float(last_5["high"].max())
-    swing_low5  = float(last_5["low"].min())
-    low_20      = float(last_20["low"].min())
-    high_20     = float(last_20["high"].max())
-
-    wick_min       = entry * WICK_MIN_PCT
-    short_trend_age = _count_trend_age(df, direction="SHORT")
-    long_trend_age  = _count_trend_age(df, direction="LONG")
-
-    # ------------------------------------------------------------------
-    # Print diagnostics
-    # ------------------------------------------------------------------
-    print(f"\n  -- Signal diagnostics  [{ts}] --")
-    print(f"  Candle  O={o:.2f}  H={h:.2f}  L={lo:.2f}  C={c:.2f}")
-    print(f"  EMA20={ema20:.2f}  EMA50={ema50:.2f}  RSI={rsi:.2f} (display only)")
-    print(f"  SHORT trend age: {short_trend_age}  |  LONG trend age: {long_trend_age}"
-          f"  (min={MIN_TREND_AGE})")
-    print(f"  Upper wick={upper_wick:.2f}  Lower wick={lower_wick:.2f}"
-          f"  (min={wick_min:.2f}, {WICK_MIN_PCT*100:.1f}% of close)")
-    print(f"  {SL_LOOKBACK}-bar: swing_high={swing_high5:.2f}"
-          f"  swing_low={swing_low5:.2f}")
-    print(f"  {TP_LOOKBACK}-bar: high={high_20:.2f}  low={low_20:.2f}")
-
-    # ------------------------------------------------------------------
-    # Evaluate SHORT conditions
-    # C1 trend      : EMA20 < EMA50
-    # C2 trend age  : >= MIN_TREND_AGE consecutive candles
-    # C3 rejection  : high > EMA20 AND close < EMA20
-    # C4 wick       : upper_wick > 0.2% of close
-    # ------------------------------------------------------------------
-    sc1 = ema20 < ema50
-    sc2 = short_trend_age >= MIN_TREND_AGE
-    sc3 = h > ema20 and c < ema20
-    sc4 = upper_wick > wick_min
-
-    print(f"\n  SHORT conditions:")
-    print(f"  {_pf(sc1)} C1 trend:      EMA20 ({ema20:.2f}) < EMA50 ({ema50:.2f})")
-    print(f"  {_pf(sc2)} C2 trend age:  {short_trend_age} candles >= {MIN_TREND_AGE}")
-    print(f"  {_pf(sc3)} C3 rejection:  high ({h:.2f}) > EMA20, close ({c:.2f}) < EMA20")
-    print(f"  {_pf(sc4)} C4 upper wick: {upper_wick:.2f} > {wick_min:.2f}")
-
-    # ------------------------------------------------------------------
-    # Evaluate LONG conditions
-    # C1 trend      : EMA20 > EMA50
-    # C2 trend age  : >= MIN_TREND_AGE consecutive candles
-    # C3 rejection  : low < EMA20 AND close > EMA20
-    # C4 wick       : lower_wick > 0.2% of close
-    # ------------------------------------------------------------------
-    lc1 = ema20 > ema50
-    lc2 = long_trend_age >= MIN_TREND_AGE
-    lc3 = lo < ema20 and c > ema20
-    lc4 = lower_wick > wick_min
-
-    print(f"\n  LONG conditions:")
-    print(f"  {_pf(lc1)} C1 trend:      EMA20 ({ema20:.2f}) > EMA50 ({ema50:.2f})")
-    print(f"  {_pf(lc2)} C2 trend age:  {long_trend_age} candles >= {MIN_TREND_AGE}")
-    print(f"  {_pf(lc3)} C3 rejection:  low ({lo:.2f}) < EMA20, close ({c:.2f}) > EMA20")
-    print(f"  {_pf(lc4)} C4 lower wick: {lower_wick:.2f} > {wick_min:.2f}")
-
-    # ------------------------------------------------------------------
-    # Fetch funding rate (optional confirmation, never blocks)
-    # ------------------------------------------------------------------
-    funding_rate = _fetch_funding_rate(exchange)
-
-    # ------------------------------------------------------------------
-    # === SHORT path ===
-    # ------------------------------------------------------------------
-    if sc1 and sc2 and sc3 and sc4:
-
-        sl_raw  = swing_high5 + entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = sl_price - entry
-
-        # Gate 1 — SL distance
-        if sl_dist < entry * SL_MIN_DIST_PCT:
-            reason = (
-                f"SHORT setup valid but SL too tight: "
-                f"distance {sl_dist:.2f} ({sl_dist/entry*100:.3f}%) "
-                f"< minimum {SL_MIN_DIST_PCT*100:.1f}% "
-                f"(SL {sl_price:.2f} vs entry {entry:.2f})"
-            )
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        # TP
-        tp_c1 = low_20
-        tp_c2 = nearest_round_support(entry, step=TP_ROUND_STEP)
-        tp_price = round(min(tp_c1, tp_c2), 2)
-
-        gain = entry - tp_price
-        risk = sl_price - entry
-
-        if risk <= 0 or gain <= 0:
-            reason = (
-                f"SHORT setup valid but TP ({tp_price:.2f}) >= entry ({entry:.2f}). "
-                f"No viable downside target."
-            )
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        rr = round(gain / risk, 2)
-
-        # Gate 2 — R:R
-        if rr < MIN_RR:
-            reason = (
-                f"R:R {rr:.2f} below minimum {MIN_RR} "
-                f"(entry={entry:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f})"
-            )
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, rr=rr, funding_rate=funding_rate)
-
-        # Funding confirmation note
-        funding_note = ""
-        if funding_rate is not None and funding_rate > 0:
-            funding_note = (
-                f" | Funding rate {funding_rate:.6f} confirms bearish "
-                f"(longs paying shorts)"
-            )
-
-        reason = (
-            f"SHORT: downtrend (EMA20={ema20:.2f} < EMA50={ema50:.2f}), "
-            f"trend age {short_trend_age} candles, "
-            f"rejection candle (high={h:.2f} pierced EMA20, closed below at {c:.2f}), "
-            f"upper wick {upper_wick:.2f} ({upper_wick/entry*100:.3f}% of close), "
-            f"RSI {rsi:.2f} (info only), "
-            f"SL={sl_price:.2f} (swing_high5={swing_high5:.2f} + {SL_BUFFER_PCT*100:.1f}% buffer), "
-            f"TP={tp_price:.2f} (min of 20-bar low {tp_c1:.2f} / round support {tp_c2:.2f}), "
-            f"R:R={rr:.2f}"
-            f"{funding_note}"
-        )
-
-        print(f"\n  [SHORT] entry={entry:.2f}  SL={sl_price:.2f}"
-              f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-
-        signal_result = {
-            "signal":       "SHORT",
-            "reason":       reason,
-            "entry_price":  entry,
-            "sl_price":     sl_price,
-            "tp_price":     tp_price,
-            "rr":           rr,
-            "funding_rate": funding_rate,
-            "ml_score":     None,
-        }
-
-        # ------------------------------------------------------------------
-        # ML filter (soft gate — requires data/ml_filter.pkl)
-        # Run:  python ml_filter.py --retrain  to generate the model.
-        # ------------------------------------------------------------------
-        if _ML_AVAILABLE:
-            try:
-                from ml_filter import MODEL_PATH as _ML_MODEL_PATH
-                import os as _os
-                if _os.path.exists(_ML_MODEL_PATH):
-                    ml_score = _ml_score_signal(signal_result)
-                    signal_result["ml_score"] = ml_score
-                    ML_THRESHOLD = 0.55
-                    if ml_score < ML_THRESHOLD:
-                        ml_reason = (
-                            f"ML filter blocked: score {ml_score:.2f} < {ML_THRESHOLD}"
-                        )
-                        print(f"  [ML] score={ml_score:.2f}  BLOCKED")
-                        return _no_trade(
-                            ml_reason,
-                            rr=rr,
-                            funding_rate=funding_rate,
-                        )
-                    else:
-                        print(f"  [ML] score={ml_score:.2f}  APPROVED")
-                else:
-                    print("  [ML] No model found — skipping filter")
-            except Exception as _ml_exc:
-                print(f"  [ML] Filter error ({_ml_exc}) — skipping")
-        else:
-            print("  [ML] No model found — skipping filter")
-
-        return signal_result
-
-    # ------------------------------------------------------------------
-    # === LONG path ===
-    # ------------------------------------------------------------------
-    if lc1 and lc2 and lc3 and lc4:
-
-        sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = entry - sl_price
-
-        # Gate 1 — SL distance
-        if sl_dist < entry * SL_MIN_DIST_PCT:
-            reason = (
-                f"LONG setup valid but SL too tight: "
-                f"distance {sl_dist:.2f} ({sl_dist/entry*100:.3f}%) "
-                f"< minimum {SL_MIN_DIST_PCT*100:.1f}% "
-                f"(SL {sl_price:.2f} vs entry {entry:.2f})"
-            )
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        # TP
-        tp_c1 = high_20
-        tp_c2 = nearest_round_resistance(entry, step=TP_ROUND_STEP)
-        tp_price = round(max(tp_c1, tp_c2), 2)
-
-        gain = tp_price - entry
-        risk = entry - sl_price
-
-        if risk <= 0 or gain <= 0:
-            reason = (
-                f"LONG setup valid but TP ({tp_price:.2f}) <= entry ({entry:.2f}). "
-                f"No viable upside target."
-            )
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        rr = round(gain / risk, 2)
-
-        # Gate 2 — R:R
-        if rr < MIN_RR:
-            reason = (
-                f"R:R {rr:.2f} below minimum {MIN_RR} "
-                f"(entry={entry:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f})"
-            )
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, rr=rr, funding_rate=funding_rate)
-
-        # Funding confirmation note (negative funding = shorts paying longs = bullish)
-        funding_note = ""
-        if funding_rate is not None and funding_rate < 0:
-            funding_note = (
-                f" | Funding rate {funding_rate:.6f} confirms bullish "
-                f"(shorts paying longs)"
-            )
-
-        reason = (
-            f"LONG: uptrend (EMA20={ema20:.2f} > EMA50={ema50:.2f}), "
-            f"trend age {long_trend_age} candles, "
-            f"rejection candle (low={lo:.2f} pierced EMA20, closed above at {c:.2f}), "
-            f"lower wick {lower_wick:.2f} ({lower_wick/entry*100:.3f}% of close), "
-            f"RSI {rsi:.2f} (info only), "
-            f"SL={sl_price:.2f} (swing_low5={swing_low5:.2f} - {SL_BUFFER_PCT*100:.1f}% buffer), "
-            f"TP={tp_price:.2f} (max of 20-bar high {tp_c1:.2f} / round resistance {tp_c2:.2f}), "
-            f"R:R={rr:.2f}"
-            f"{funding_note}"
-        )
-
-        print(f"\n  [LONG] entry={entry:.2f}  SL={sl_price:.2f}"
-              f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-
-        signal_result = {
-            "signal":       "LONG",
-            "reason":       reason,
-            "entry_price":  entry,
-            "sl_price":     sl_price,
-            "tp_price":     tp_price,
-            "rr":           rr,
-            "funding_rate": funding_rate,
-            "ml_score":     None,
-        }
-
-        # ML filter (same soft gate as SHORT)
-        if _ML_AVAILABLE:
-            try:
-                from ml_filter import MODEL_PATH as _ML_MODEL_PATH
-                import os as _os
-                if _os.path.exists(_ML_MODEL_PATH):
-                    ml_score = _ml_score_signal(signal_result)
-                    signal_result["ml_score"] = ml_score
-                    ML_THRESHOLD = 0.55
-                    if ml_score < ML_THRESHOLD:
-                        ml_reason = (
-                            f"ML filter blocked: score {ml_score:.2f} < {ML_THRESHOLD}"
-                        )
-                        print(f"  [ML] score={ml_score:.2f}  BLOCKED")
-                        return _no_trade(
-                            ml_reason,
-                            rr=rr,
-                            funding_rate=funding_rate,
-                        )
-                    else:
-                        print(f"  [ML] score={ml_score:.2f}  APPROVED")
-                else:
-                    print("  [ML] No model found — skipping filter")
-            except Exception as _ml_exc:
-                print(f"  [ML] Filter error ({_ml_exc}) — skipping")
-        else:
-            print("  [ML] No model found — skipping filter")
-
-        return signal_result
-
-    # ------------------------------------------------------------------
-    # === Strategy 2: Bollinger Band bounce (mean-reversion) ===
-    # ------------------------------------------------------------------
-    bb_upper = float(latest["bb_upper"])
-    bb_mid   = float(latest["bb_mid"])
-    bb_lower = float(latest["bb_lower"])
-    bullish_body = c > o
-    bearish_body = c < o
-
-    # BB LONG: price bounced off lower band
-    bb_l1 = c > bb_lower              # closed back inside bands
-    bb_l2 = lo < bb_lower             # wick pierced below lower band
-    bb_l3 = rsi < BB_RSI_OVERSOLD     # oversold confirmation
-    bb_l4 = bullish_body              # bullish candle confirms bounce
-
-    # BB SHORT: price rejected from upper band
-    bb_s1 = c < bb_upper              # closed back inside bands
-    bb_s2 = h > bb_upper              # wick pierced above upper band
-    bb_s3 = rsi > BB_RSI_OVERBOUGHT   # overbought confirmation
-    bb_s4 = bearish_body              # bearish candle confirms rejection
-
-    print(f"\n  [S2] Bollinger Band bounce:")
-    print(f"  BB upper={bb_upper:.2f}  mid={bb_mid:.2f}  lower={bb_lower:.2f}")
-    print(f"\n  BB SHORT conditions:")
-    print(f"  {_pf(bb_s1)} B1 close inside: close ({c:.2f}) < bb_upper ({bb_upper:.2f})")
-    print(f"  {_pf(bb_s2)} B2 wick pierce:  high ({h:.2f}) > bb_upper ({bb_upper:.2f})")
-    print(f"  {_pf(bb_s3)} B3 overbought:   RSI ({rsi:.2f}) > {BB_RSI_OVERBOUGHT}")
-    print(f"  {_pf(bb_s4)} B4 bearish body: close ({c:.2f}) < open ({o:.2f})")
-    print(f"\n  BB LONG conditions:")
-    print(f"  {_pf(bb_l1)} B1 close inside: close ({c:.2f}) > bb_lower ({bb_lower:.2f})")
-    print(f"  {_pf(bb_l2)} B2 wick pierce:  low ({lo:.2f}) < bb_lower ({bb_lower:.2f})")
-    print(f"  {_pf(bb_l3)} B3 oversold:     RSI ({rsi:.2f}) < {BB_RSI_OVERSOLD}")
-    print(f"  {_pf(bb_l4)} B4 bullish body: close ({c:.2f}) > open ({o:.2f})")
-
-    # --- BB SHORT path ---
-    if bb_s1 and bb_s2 and bb_s3 and bb_s4:
-        sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = sl_price - entry
-
-        if sl_dist < entry * SL_MIN_DIST_PCT:
-            reason = (f"BB SHORT setup valid but SL too tight: "
-                      f"distance {sl_dist:.2f} < min {SL_MIN_DIST_PCT*100:.1f}%")
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        tp_price = round(bb_mid, 2)
-        gain = entry - tp_price
-        risk = sl_price - entry
-
-        if risk <= 0 or gain <= 0:
-            reason = (f"BB SHORT: TP ({tp_price:.2f}) >= entry ({entry:.2f})")
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        rr = round(gain / risk, 2)
-        if rr < MIN_RR:
-            reason = (f"BB SHORT R:R {rr:.2f} below minimum {MIN_RR} "
-                      f"(entry={entry:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f})")
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, rr=rr, funding_rate=funding_rate)
-
-        reason = (
-            f"BB SHORT: price rejected upper band (H={h:.2f} > BB_upper={bb_upper:.2f}, "
-            f"C={c:.2f} back inside), RSI={rsi:.2f} overbought, bearish body, "
-            f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
-        )
-        print(f"\n  [S2 SHORT] entry={entry:.2f}  SL={sl_price:.2f}"
-              f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-
-        return {
-            "signal": "SHORT", "reason": reason, "strategy": "bb_bounce",
-            "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
-            "rr": rr, "funding_rate": funding_rate, "ml_score": None,
-        }
-
-    # --- BB LONG path ---
-    if bb_l1 and bb_l2 and bb_l3 and bb_l4:
-        sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = entry - sl_price
-
-        if sl_dist < entry * SL_MIN_DIST_PCT:
-            reason = (f"BB LONG setup valid but SL too tight: "
-                      f"distance {sl_dist:.2f} < min {SL_MIN_DIST_PCT*100:.1f}%")
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        tp_price = round(bb_mid, 2)
-        gain = tp_price - entry
-        risk = entry - sl_price
-
-        if risk <= 0 or gain <= 0:
-            reason = (f"BB LONG: TP ({tp_price:.2f}) <= entry ({entry:.2f})")
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, funding_rate=funding_rate)
-
-        rr = round(gain / risk, 2)
-        if rr < MIN_RR:
-            reason = (f"BB LONG R:R {rr:.2f} below minimum {MIN_RR} "
-                      f"(entry={entry:.2f}, SL={sl_price:.2f}, TP={tp_price:.2f})")
-            print(f"\n  [NO_TRADE] {reason}")
-            return _no_trade(reason, rr=rr, funding_rate=funding_rate)
-
-        reason = (
-            f"BB LONG: price bounced off lower band (L={lo:.2f} < BB_lower={bb_lower:.2f}, "
-            f"C={c:.2f} back inside), RSI={rsi:.2f} oversold, bullish body, "
-            f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
-        )
-        print(f"\n  [S2 LONG] entry={entry:.2f}  SL={sl_price:.2f}"
-              f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-
-        return {
-            "signal": "LONG", "reason": reason, "strategy": "bb_bounce",
-            "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
-            "rr": rr, "funding_rate": funding_rate, "ml_score": None,
-        }
-
-    # ------------------------------------------------------------------
-    # === Strategy 3: EMA crossover (trend change entry) ===
-    # Fires when EMA20 just crossed EMA50 (previous candle was opposite).
-    # LONG:  prev EMA20 <= EMA50, now EMA20 > EMA50, bullish body
-    # SHORT: prev EMA20 >= EMA50, now EMA20 < EMA50, bearish body
-    # ------------------------------------------------------------------
-    prev = df.iloc[-2] if len(df) >= 2 else None
-    body_pct = abs(c - o) / c if c > 0 else 0
-    adx = float(latest["adx_14"])
-    adx_ok = adx >= ADX_MIN
-
-    if prev is not None:
-        prev_ema20 = float(prev["ema_20"])
-        prev_ema50 = float(prev["ema_50"])
-        cross_long  = prev_ema20 <= prev_ema50 and ema20 > ema50
-        cross_short = prev_ema20 >= prev_ema50 and ema20 < ema50
-        body_ok     = body_pct >= EMA_CROSS_BODY_MIN_PCT
+    if "funding_rate" in df.columns:
+        funding_rate = float(curr["funding_rate"]) if pd.notna(curr.get("funding_rate")) else None
+        funding_24h  = float(curr.get("funding_24h", 0)) if pd.notna(curr.get("funding_24h")) else None
+    elif current_funding:
+        funding_rate = current_funding.get("rate")
+        funding_24h  = current_funding.get("funding_24h")
     else:
-        prev_ema20 = prev_ema50 = 0
-        cross_long = cross_short = body_ok = False
+        return no_trade("No funding data available")
 
-    ec_l1 = cross_long
-    ec_l2 = bullish_body and body_ok
-    ec_l3 = adx_ok
-    ec_s1 = cross_short
-    ec_s2 = bearish_body and body_ok
-    ec_s3 = adx_ok
-
-    print(f"\n  [S3] EMA crossover (ADX={adx:.2f}, min={ADX_MIN}):")
-    print(f"  Prev EMA20={prev_ema20:.2f}  Prev EMA50={prev_ema50:.2f}")
-    print(f"  Body={body_pct*100:.3f}% (min={EMA_CROSS_BODY_MIN_PCT*100:.1f}%)")
-    print(f"  {_pf(ec_s1)} Cross SHORT: prev EMA20 >= EMA50, now EMA20 < EMA50")
-    print(f"  {_pf(ec_s2)} Bearish body with conviction")
-    print(f"  {_pf(ec_s3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
-    print(f"  {_pf(ec_l1)} Cross LONG:  prev EMA20 <= EMA50, now EMA20 > EMA50")
-    print(f"  {_pf(ec_l2)} Bullish body with conviction")
-    print(f"  {_pf(ec_l3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
-
-    # --- EMA Cross SHORT ---
-    if ec_s1 and ec_s2 and ec_s3:
-        sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = sl_price - entry
-
-        if sl_dist >= entry * SL_MIN_DIST_PCT:
-            tp_c1 = low_20
-            tp_c2 = nearest_round_support(entry, step=TP_ROUND_STEP)
-            tp_price = round(min(tp_c1, tp_c2), 2)
-            gain = entry - tp_price
-            risk = sl_price - entry
-
-            if risk > 0 and gain > 0:
-                rr = round(gain / risk, 2)
-                if rr >= MIN_RR:
-                    reason = (
-                        f"EMA Cross SHORT: EMA20 crossed below EMA50 "
-                        f"(prev {prev_ema20:.2f}/{prev_ema50:.2f}, now {ema20:.2f}/{ema50:.2f}), "
-                        f"bearish body {body_pct*100:.3f}%, "
-                        f"SL={sl_price:.2f}, TP={tp_price:.2f}, R:R={rr:.2f}"
-                    )
-                    print(f"\n  [S3 SHORT] entry={entry:.2f}  SL={sl_price:.2f}"
-                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-                    return {
-                        "signal": "SHORT", "reason": reason, "strategy": "ema_cross",
-                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
-                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
-                    }
-
-    # --- EMA Cross LONG ---
-    if ec_l1 and ec_l2 and ec_l3:
-        sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = entry - sl_price
-
-        if sl_dist >= entry * SL_MIN_DIST_PCT:
-            tp_c1 = high_20
-            tp_c2 = nearest_round_resistance(entry, step=TP_ROUND_STEP)
-            tp_price = round(max(tp_c1, tp_c2), 2)
-            gain = tp_price - entry
-            risk = entry - sl_price
-
-            if risk > 0 and gain > 0:
-                rr = round(gain / risk, 2)
-                if rr >= MIN_RR:
-                    reason = (
-                        f"EMA Cross LONG: EMA20 crossed above EMA50 "
-                        f"(prev {prev_ema20:.2f}/{prev_ema50:.2f}, now {ema20:.2f}/{ema50:.2f}), "
-                        f"bullish body {body_pct*100:.3f}%, "
-                        f"SL={sl_price:.2f}, TP={tp_price:.2f}, R:R={rr:.2f}"
-                    )
-                    print(f"\n  [S3 LONG] entry={entry:.2f}  SL={sl_price:.2f}"
-                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-                    return {
-                        "signal": "LONG", "reason": reason, "strategy": "ema_cross",
-                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
-                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
-                    }
+    if funding_rate is None:
+        return no_trade("Funding rate is None")
 
     # ------------------------------------------------------------------
-    # === Strategy 4: RSI reversal (extreme exit) ===
-    # Fires when RSI just exited an extreme zone.
-    # LONG:  prev RSI < 30, now RSI >= 30, bullish body
-    # SHORT: prev RSI > 70, now RSI <= 70, bearish body
+    # Diagnostics
     # ------------------------------------------------------------------
-    if prev is not None and not pd.isna(prev["rsi_14"]):
-        prev_rsi = float(prev["rsi_14"])
+    print(f"\n  -- Funding Rate Signal Diagnostics --")
+    print(f"  Candle  O={opn:.2f}  H={high:.2f}  L={low:.2f}  C={close:.2f}  V={vol:.0f}")
+    print(f"  Prev    H={prev_high:.2f}  L={prev_low:.2f}")
+    print(f"  Funding rate:  {funding_rate:+.6f}  ({funding_rate*100:+.4f}%)")
+    if funding_24h is not None:
+        print(f"  Funding 24h:   {funding_24h:+.6f}  ({funding_24h*100:+.4f}%)")
+
+    # ------------------------------------------------------------------
+    # SETUP — Is funding extreme?
+    # ------------------------------------------------------------------
+    # Primary: single-rate threshold
+    setup_short = funding_rate > FUNDING_THRESHOLD
+    setup_long  = funding_rate < -FUNDING_THRESHOLD
+
+    # Secondary: cumulative 24h threshold (stronger signal)
+    if funding_24h is not None:
+        cum_short = funding_24h > FUNDING_24H_THRESH
+        cum_long  = funding_24h < -FUNDING_24H_THRESH
     else:
-        prev_rsi = 50.0  # neutral default
+        cum_short = False
+        cum_long  = False
 
-    rsi_long  = prev_rsi < RSI_EXTREME_LOW and rsi >= RSI_EXTREME_LOW
-    rsi_short = prev_rsi > RSI_EXTREME_HIGH and rsi <= RSI_EXTREME_HIGH
+    # Either threshold triggers the setup
+    short_setup = setup_short or cum_short
+    long_setup  = setup_long or cum_long
 
-    rs_l1 = rsi_long
-    rs_l2 = bullish_body and body_ok
-    rs_l3 = adx_ok
-    rs_s1 = rsi_short
-    rs_s2 = bearish_body and body_ok
-    rs_s3 = adx_ok
+    setup_reasons = []
+    if setup_short:
+        setup_reasons.append(f"rate {funding_rate*100:+.4f}% > +{FUNDING_THRESHOLD*100:.2f}%")
+    if cum_short:
+        setup_reasons.append(f"24h {funding_24h*100:+.4f}% > +{FUNDING_24H_THRESH*100:.2f}%")
+    if setup_long:
+        setup_reasons.append(f"rate {funding_rate*100:+.4f}% < -{FUNDING_THRESHOLD*100:.2f}%")
+    if cum_long:
+        setup_reasons.append(f"24h {funding_24h*100:+.4f}% < -{FUNDING_24H_THRESH*100:.2f}%")
 
-    print(f"\n  [S4] RSI reversal (ADX={adx:.2f}, min={ADX_MIN}):")
-    print(f"  Prev RSI={prev_rsi:.2f}  Current RSI={rsi:.2f}")
-    print(f"  {_pf(rs_s1)} RSI exit overbought: prev > {RSI_EXTREME_HIGH}, now <= {RSI_EXTREME_HIGH}")
-    print(f"  {_pf(rs_s2)} Bearish body with conviction")
-    print(f"  {_pf(rs_s3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
-    print(f"  {_pf(rs_l1)} RSI exit oversold:   prev < {RSI_EXTREME_LOW}, now >= {RSI_EXTREME_LOW}")
-    print(f"  {_pf(rs_l2)} Bullish body with conviction")
-    print(f"  {_pf(rs_l3)} ADX filter: {adx:.2f} >= {ADX_MIN}")
+    print(f"\n  Setup conditions:")
+    print(f"  [{'PASS' if short_setup else 'FAIL'}] SHORT setup (longs over-leveraged): "
+          f"rate={funding_rate*100:+.4f}% threshold=±{FUNDING_THRESHOLD*100:.2f}%")
+    print(f"  [{'PASS' if long_setup else 'FAIL'}] LONG setup  (shorts over-leveraged): "
+          f"rate={funding_rate*100:+.4f}% threshold=±{FUNDING_THRESHOLD*100:.2f}%")
 
-    # --- RSI Reversal SHORT ---
-    if rs_s1 and rs_s2 and rs_s3:
-        sl_raw   = swing_high5 + entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = sl_price - entry
-
-        if sl_dist >= entry * SL_MIN_DIST_PCT:
-            tp_price = round(bb_mid, 2)  # mean-reversion to BB mid
-            gain = entry - tp_price
-            risk = sl_price - entry
-
-            if risk > 0 and gain > 0:
-                rr = round(gain / risk, 2)
-                if rr >= MIN_RR:
-                    reason = (
-                        f"RSI Reversal SHORT: RSI exited overbought "
-                        f"(prev {prev_rsi:.2f} > {RSI_EXTREME_HIGH}, now {rsi:.2f}), "
-                        f"bearish body {body_pct*100:.3f}%, "
-                        f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
-                    )
-                    print(f"\n  [S4 SHORT] entry={entry:.2f}  SL={sl_price:.2f}"
-                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-                    return {
-                        "signal": "SHORT", "reason": reason, "strategy": "rsi_reversal",
-                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
-                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
-                    }
-
-    # --- RSI Reversal LONG ---
-    if rs_l1 and rs_l2 and rs_l3:
-        sl_raw   = swing_low5 - entry * SL_BUFFER_PCT
-        sl_price = round(sl_raw, 2)
-        sl_dist  = entry - sl_price
-
-        if sl_dist >= entry * SL_MIN_DIST_PCT:
-            tp_price = round(bb_mid, 2)  # mean-reversion to BB mid
-            gain = tp_price - entry
-            risk = entry - sl_price
-
-            if risk > 0 and gain > 0:
-                rr = round(gain / risk, 2)
-                if rr >= MIN_RR:
-                    reason = (
-                        f"RSI Reversal LONG: RSI exited oversold "
-                        f"(prev {prev_rsi:.2f} < {RSI_EXTREME_LOW}, now {rsi:.2f}), "
-                        f"bullish body {body_pct*100:.3f}%, "
-                        f"SL={sl_price:.2f}, TP={tp_price:.2f} (BB mid), R:R={rr:.2f}"
-                    )
-                    print(f"\n  [S4 LONG] entry={entry:.2f}  SL={sl_price:.2f}"
-                          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
-                    return {
-                        "signal": "LONG", "reason": reason, "strategy": "rsi_reversal",
-                        "entry_price": entry, "sl_price": sl_price, "tp_price": tp_price,
-                        "rr": rr, "funding_rate": funding_rate, "ml_score": None,
-                    }
+    if not short_setup and not long_setup:
+        return no_trade(
+            f"No funding extreme: rate={funding_rate*100:+.4f}% "
+            f"(threshold=±{FUNDING_THRESHOLD*100:.2f}%)"
+        )
 
     # ------------------------------------------------------------------
-    # === NO_TRADE — explain failed conditions ===
+    # TIME FILTER — Settlement proximity (optional)
     # ------------------------------------------------------------------
-    short_fails = []
-    if not sc1: short_fails.append(
-        f"EMA20 ({ema20:.2f}) not < EMA50 ({ema50:.2f}) — no downtrend")
-    if not sc2: short_fails.append(
-        f"trend too young: {short_trend_age} candles (min {MIN_TREND_AGE})")
-    if not sc3: short_fails.append(
-        f"no rejection (H={h:.2f}, C={c:.2f}, EMA20={ema20:.2f})")
-    if not sc4: short_fails.append(
-        f"upper wick {upper_wick:.2f} < min {wick_min:.2f}")
+    if USE_SETTLEMENT_FILTER:
+        candle_ts = df.index[-1]
+        in_window = _in_settlement_window(candle_ts)
+        next_settle = None
+        for sh in sorted(SETTLEMENT_HOURS):
+            if candle_ts.hour < sh:
+                next_settle = sh
+                break
+        if next_settle is None:
+            next_settle = SETTLEMENT_HOURS[0]  # wraps to 00:00
 
-    long_fails = []
-    if not lc1: long_fails.append(
-        f"EMA20 ({ema20:.2f}) not > EMA50 ({ema50:.2f}) — no uptrend")
-    if not lc2: long_fails.append(
-        f"trend too young: {long_trend_age} candles (min {MIN_TREND_AGE})")
-    if not lc3: long_fails.append(
-        f"no rejection (L={lo:.2f}, C={c:.2f}, EMA20={ema20:.2f})")
-    if not lc4: long_fails.append(
-        f"lower wick {lower_wick:.2f} < min {wick_min:.2f}")
+        print(f"\n  Time filter:")
+        print(f"  [{'PASS' if in_window else 'FAIL'}] Settlement window: "
+              f"candle {candle_ts.strftime('%H:%M')} UTC, "
+              f"next settlement {next_settle:02d}:00 UTC, "
+              f"window={SETTLEMENT_WINDOW_H}h before")
 
-    parts = []
-    if short_fails:
-        parts.append("SHORT: " + "; ".join(short_fails))
-    if long_fails:
-        parts.append("LONG: " + "; ".join(long_fails))
-    reason = " | ".join(parts) if parts else "No conditions met."
-    print(f"\n  [NO_TRADE] {reason}")
-    return _no_trade(reason, funding_rate=funding_rate)
+        if not in_window:
+            setup_dir = "SHORT" if short_setup else "LONG"
+            return no_trade(
+                f"{setup_dir} setup active ({', '.join(setup_reasons)}) "
+                f"but outside settlement window: "
+                f"{candle_ts.strftime('%H:%M')} UTC "
+                f"(next settle {next_settle:02d}:00, window={SETTLEMENT_WINDOW_H}h)"
+            )
 
+    # ------------------------------------------------------------------
+    # TRIGGER — Price action confirms the squeeze
+    # ------------------------------------------------------------------
+    # Volume spike check
+    vol_series = df["volume"].iloc[-(VOLUME_LOOKBACK + 1):-1].astype(float)
+    avg_vol    = vol_series.mean()
+    vol_ratio  = vol / avg_vol if avg_vol > 0 else 0
+    vol_ok     = vol_ratio >= VOLUME_SPIKE_MULT
 
-# ---------------------------------------------------------------------------
-# Print helper
-# ---------------------------------------------------------------------------
+    # Price breakdown
+    bearish_break = close < prev_low     # closes below previous candle's low
+    bullish_break = close > prev_high    # closes above previous candle's high
 
-def print_signal(result: dict) -> None:
-    """Print the signal dict in a readable summary block."""
-    sig = result["signal"]
-    tag = {"LONG": "[  LONG  ]", "SHORT": "[ SHORT  ]",
-           "NO_TRADE": "[NO TRADE]"}[sig]
-    width = 66
-    print("\n" + "=" * width)
-    print(f"  SIGNAL: {tag}")
-    print("=" * width)
-    print(f"  Reason      : {result['reason']}")
-    if result["entry_price"] is not None:
-        ep = result["entry_price"]
-        sl = result["sl_price"]
-        tp = result["tp_price"]
-        print(f"  Entry       : {ep:.2f}")
-        print(f"  Stop-loss   : {sl:.2f}  ({abs(sl-ep)/ep*100:.3f}% from entry)")
-        print(f"  Take-profit : {tp:.2f}  ({abs(tp-ep)/ep*100:.3f}% from entry)")
-    if result.get("rr") is not None:
-        print(f"  R:R         : {result['rr']:.2f}")
-    if result.get("funding_rate") is not None:
-        print(f"  Funding rate: {result['funding_rate']:.6f}")
-    print("=" * width)
+    # Body confirmation (not a doji)
+    body_pct = abs(close - opn) / close if close > 0 else 0
+    has_body = body_pct > 0.0005  # > 0.05% body
 
+    print(f"\n  Trigger conditions:")
+    print(f"  [{'PASS' if vol_ok else 'FAIL'}] Volume spike: "
+          f"{vol:.0f} / avg {avg_vol:.0f} = {vol_ratio:.2f}x (min {VOLUME_SPIKE_MULT}x)")
+    print(f"  [{'PASS' if bearish_break else 'FAIL'}] Bearish break: "
+          f"close {close:.2f} < prev_low {prev_low:.2f}")
+    print(f"  [{'PASS' if bullish_break else 'FAIL'}] Bullish break: "
+          f"close {close:.2f} > prev_high {prev_high:.2f}")
+    print(f"  [{'PASS' if has_body else 'FAIL'}] Body: {body_pct*100:.3f}% (min 0.05%)")
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
+    # SHORT trigger: funding extreme positive + bearish breakdown
+    short_trigger = short_setup and bearish_break and vol_ok and has_body
+    # LONG trigger: funding extreme negative + bullish breakdown
+    long_trigger  = long_setup and bullish_break and vol_ok and has_body
 
-if __name__ == "__main__":
-    from fetch_data import fetch_ohlcv
-    from indicators import compute_indicators
-    from bitmex_client import get_client
+    if not short_trigger and not long_trigger:
+        if short_setup:
+            reason = (f"SHORT setup active ({', '.join(setup_reasons)}) "
+                      f"but no trigger: break={'Y' if bearish_break else 'N'} "
+                      f"vol={vol_ratio:.2f}x body={body_pct*100:.3f}%")
+        else:
+            reason = (f"LONG setup active ({', '.join(setup_reasons)}) "
+                      f"but no trigger: break={'Y' if bullish_break else 'N'} "
+                      f"vol={vol_ratio:.2f}x body={body_pct*100:.3f}%")
+        return no_trade(reason)
 
-    print("Phase 3 (rewritten) — Signal generation on XBTUSDT 15m candles\n")
+    # ------------------------------------------------------------------
+    # Determine direction
+    # ------------------------------------------------------------------
+    if short_trigger:
+        direction = "SHORT"
+    else:
+        direction = "LONG"
 
-    print("Fetching OHLCV data from BitMEX testnet...")
-    df_raw = fetch_ohlcv()
-    if df_raw is None:
-        raise SystemExit("[ABORT] Could not fetch OHLCV data.")
-    print(f"[OK] Received {len(df_raw)} candles.\n")
+    # ------------------------------------------------------------------
+    # SL + TP calculation
+    # ------------------------------------------------------------------
+    entry = close
+    lookback = df.iloc[-(SL_LOOKBACK + 1):-1]
 
-    print("Computing indicators...")
-    df_enriched = compute_indicators(df_raw)
-    if df_enriched is None:
-        raise SystemExit("[ABORT] Indicator computation failed.")
-    print("[OK] Indicators computed.\n")
+    if direction == "SHORT":
+        swing_high = float(lookback["high"].max())
+        sl_price   = swing_high * (1 + SL_BUFFER_PCT)
+        sl_dist    = sl_price - entry
 
-    try:
-        exchange = get_client()
-    except Exception as e:
-        print(f"[WARN] Could not connect to exchange for funding rate: {e}")
-        exchange = None
+        # Min distance check
+        if sl_dist / entry < SL_MIN_DIST_PCT:
+            return no_trade(
+                f"SHORT SL too tight: {sl_dist:.2f} ({sl_dist/entry*100:.3f}%) "
+                f"< min {SL_MIN_DIST_PCT*100:.2f}%"
+            )
 
-    result = get_signal(df_enriched, exchange=exchange)
-    print_signal(result)
+        tp_price = entry - (sl_dist * TARGET_RR)
+        rr = (entry - tp_price) / sl_dist
+
+    else:  # LONG
+        swing_low = float(lookback["low"].min())
+        sl_price  = swing_low * (1 - SL_BUFFER_PCT)
+        sl_dist   = entry - sl_price
+
+        if sl_dist / entry < SL_MIN_DIST_PCT:
+            return no_trade(
+                f"LONG SL too tight: {sl_dist:.2f} ({sl_dist/entry*100:.3f}%) "
+                f"< min {SL_MIN_DIST_PCT*100:.2f}%"
+            )
+
+        tp_price = entry + (sl_dist * TARGET_RR)
+        rr = (tp_price - entry) / sl_dist
+
+    if rr < MIN_RR:
+        return no_trade(f"R:R {rr:.2f} < minimum {MIN_RR}")
+
+    reason = (f"Funding {direction}: {', '.join(setup_reasons)} | "
+              f"Trigger: {'bearish' if direction == 'SHORT' else 'bullish'} break "
+              f"+ vol {vol_ratio:.1f}x")
+
+    print(f"\n  [{direction}] entry={entry:.2f}  SL={sl_price:.2f}"
+          f"  TP={tp_price:.2f}  R:R={rr:.2f}")
+
+    return {
+        "signal":       direction,
+        "reason":       reason,
+        "entry_price":  entry,
+        "sl_price":     sl_price,
+        "tp_price":     tp_price,
+        "rr":           rr,
+        "funding_rate": funding_rate,
+        "funding_24h":  funding_24h,
+    }

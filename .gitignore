@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+/.credentials
 
 # OHLCV output and any future data files
 data/

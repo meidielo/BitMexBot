@@ -1,28 +1,26 @@
 """
-main.py — Phase 6
+main.py — V2: Funding Rate Mean Reversion
 
-Full bot loop:
-  1. Fetch candles          (fetch_data.py)
-  2. Compute indicators     (indicators.py)
-  3. Get signal             (signals.py)
-  4. Validate with risk     (risk.py)
-  5. Execute if approved    (order_manager.py)
-  6. Log result             (logger.py)
+Bot loop:
+  1. Fetch 15m candles           (fetch_data.py)
+  2. Fetch current funding rate  (fetch_data.py)
+  3. Get signal                  (signals.py — funding extreme + price trigger)
+  4. Validate with risk          (risk.py)
+  5. Execute if approved         (order_manager.py)
+  6. Log result                  (logger.py)
   7. Sleep to next 15m bar, repeat
 
-Stops cleanly on Ctrl-C.  Prints a heartbeat line every loop.
+Stops cleanly on Ctrl-C.
 TESTNET ONLY — order_manager enforces BITMEX_TESTNET=true.
 """
 
-import os
 import time
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
 from bitmex_client  import get_client
-from fetch_data     import fetch_ohlcv
-from indicators     import compute_indicators
+from fetch_data     import fetch_ohlcv, fetch_current_funding, fetch_recent_funding
 from signals        import get_signal
 from risk           import validate_signal
 from order_manager  import execute_signal
@@ -36,23 +34,18 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 SYMBOL          = "BTC/USDT:USDT"
 CANDLE_SECONDS  = 15 * 60        # 15-minute bars = 900 s
-LOOP_SLEEP      = CANDLE_SECONDS  # aim for one iteration per bar
-RETRY_SLEEP     = 60              # seconds to wait before re-evaluating a failed order
+LOOP_SLEEP      = CANDLE_SECONDS
+RETRY_SLEEP     = 60
 
 
 # ---------------------------------------------------------------------------
-# Exchange helpers  (account balance + open positions)
+# Exchange helpers
 # ---------------------------------------------------------------------------
 
 def _get_balance_usd(exchange, close_price: float) -> float:
-    """
-    Fetch free BTC balance from testnet and convert to USD at close_price.
-    BitMEX testnet wallets are denominated in BTC (inverse margin).
-    Returns 0.0 on any error so the risk filter safely vetoes.
-    """
     try:
-        bal   = exchange.fetch_balance()
-        btc   = float(bal.get("BTC", {}).get("free", 0.0))
+        bal = exchange.fetch_balance()
+        btc = float(bal.get("BTC", {}).get("free", 0.0))
         return round(btc * close_price, 4)
     except Exception as e:
         print(f"[WARN] Could not fetch balance: {e}. Using $0.")
@@ -60,36 +53,22 @@ def _get_balance_usd(exchange, close_price: float) -> float:
 
 
 def _get_open_positions(exchange) -> list:
-    """
-    Return a list of open position dicts for SYMBOL.
-    An empty list means no open positions (safe to trade).
-    Returns [] on any error so the risk filter safely vetoes (one-trade rule).
-    """
     try:
         positions = exchange.fetch_positions([SYMBOL])
-        return [
-            p for p in positions
-            if float(p.get("contracts") or 0) != 0
-        ]
+        return [p for p in positions if float(p.get("contracts") or 0) != 0]
     except Exception as e:
-        print(f"[WARN] Could not fetch positions: {e}. Assuming one open position (safe veto).")
-        # Return a dummy entry so risk.py blocks the trade rather than
-        # accidentally opening a duplicate position.
+        print(f"[WARN] Could not fetch positions: {e}.")
         return [{"error": str(e)}]
 
 
 # ---------------------------------------------------------------------------
-# Exit detection helpers
+# Exit detection
 # ---------------------------------------------------------------------------
 
 def _fetch_exit_price(exchange, order_id: str, fallback: float) -> float:
-    """
-    Try to retrieve the average fill price for a closed order.
-    Falls back to the current candle close price if the exchange call fails.
-    """
     try:
         order = exchange.fetch_order(order_id, SYMBOL)
-        avg   = order.get("average")
+        avg = order.get("average")
         if avg:
             return float(avg)
     except Exception as e:
@@ -98,15 +77,11 @@ def _fetch_exit_price(exchange, order_id: str, fallback: float) -> float:
 
 
 def _determine_exit_reason(signal: dict, exit_price: float) -> str:
-    """
-    Classify the exit as TP, SL, or MANUAL based on where the exit price
-    landed relative to the signal's sl_price / tp_price.
-    """
     if signal is None:
         return "MANUAL"
     direction = signal.get("signal")
-    sl        = signal.get("sl_price")
-    tp        = signal.get("tp_price")
+    sl = signal.get("sl_price")
+    tp = signal.get("tp_price")
     if sl is None or tp is None:
         return "MANUAL"
     if direction == "SHORT":
@@ -114,7 +89,7 @@ def _determine_exit_reason(signal: dict, exit_price: float) -> str:
             return "TP"
         if exit_price >= float(sl):
             return "SL"
-    else:  # LONG
+    else:
         if exit_price >= float(tp):
             return "TP"
         if exit_price <= float(sl):
@@ -123,34 +98,16 @@ def _determine_exit_reason(signal: dict, exit_price: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Retry logic
+# Retry + heartbeat
 # ---------------------------------------------------------------------------
 
-def _should_retry(order_result: dict | None) -> bool:
-    """
-    Return True if the loop should sleep RETRY_SLEEP seconds and retry,
-    rather than waiting for the next 15m candle boundary.
-
-    Retry when: an order was attempted but failed for any reason —
-    timeout (price never reached our limit), exchange error, SL placement
-    failure, etc.  The signal may still be valid; we re-check every 60s
-    until either the trade fills or conditions change.
-
-    No retry when: no order was attempted (NO_TRADE / risk vetoed), or
-    the order placed and filled successfully.
-    """
+def _should_retry(order_result):
     if order_result is None:
         return False
     return order_result.get("status") == "failed"
 
 
-# ---------------------------------------------------------------------------
-# Heartbeat
-# ---------------------------------------------------------------------------
-
-def _heartbeat(ts: str, signal: dict, risk: dict,
-               order: dict | None, sleep_msg: str) -> None:
-    """Print one compact status line per loop iteration."""
+def _heartbeat(ts, signal, risk, order, sleep_msg):
     sig_tag  = signal.get("signal", "?")
     approved = risk.get("approved", False)
 
@@ -162,7 +119,6 @@ def _heartbeat(ts: str, signal: dict, risk: dict,
         action = f"ORDER FAILED  — {order.get('error', '?')}"
 
     risk_tag = "APPROVED" if approved else f"VETOED ({_short_reason(risk)})"
-
     print(
         f"[{ts}]  signal={sig_tag:<9}"
         f"  risk={risk_tag:<40}"
@@ -171,13 +127,10 @@ def _heartbeat(ts: str, signal: dict, risk: dict,
     )
 
 
-def _short_reason(risk: dict) -> str:
-    """Trim the risk reason to a short tag for the heartbeat line."""
+def _short_reason(risk):
     reason = risk.get("reason", "")
-    # Pull the rule number from "Rule N FAILED: …" if present
     if "Rule" in reason and "FAILED" in reason:
-        parts = reason.split(":")
-        return parts[0].strip()
+        return reason.split(":")[0].strip()
     return reason[:40]
 
 
@@ -187,7 +140,7 @@ def _short_reason(risk: dict) -> str:
 
 def main() -> None:
     print("=" * 62)
-    print("  BitMEX Trading Bot — Phase 6")
+    print("  BitMEX Trading Bot — V2: Funding Rate Mean Reversion")
     print("  TESTNET ONLY.  Ctrl-C to stop cleanly.")
     print("=" * 62)
     print()
@@ -198,59 +151,65 @@ def main() -> None:
         raise SystemExit(f"[ABORT] Could not create exchange client: {e}")
 
     loop_count      = 0
-    active_order_id = None   # order_id of the currently open position, or None
-    active_signal   = None   # signal dict that opened the current position
+    active_order_id = None
+    active_signal   = None
 
     try:
         while True:
             loop_start = time.time()
             loop_count += 1
-            now_utc    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
             print(f"\n{'─' * 62}")
             print(f"  Loop #{loop_count}  —  {now_utc}")
             print(f"{'─' * 62}")
 
-            order_result = None   # reset each iteration
+            order_result = None
 
             # ----------------------------------------------------------
-            # Step 1 — Fetch candles
+            # Step 1 — Fetch 15m candles
             # ----------------------------------------------------------
-            df_raw = fetch_ohlcv()
-            if df_raw is None:
-                print("[WARN] fetch_ohlcv returned None — skipping this bar.")
-                _sleep_to_next_bar(loop_start)
-                continue
-
-            close_price = float(df_raw["close"].iloc[-1])
-
-            # ----------------------------------------------------------
-            # Step 2 — Indicators
-            # ----------------------------------------------------------
-            df = compute_indicators(df_raw)
+            df = fetch_ohlcv()
             if df is None:
-                print("[WARN] compute_indicators returned None — skipping.")
+                print("[WARN] fetch_ohlcv returned None — skipping.")
                 _sleep_to_next_bar(loop_start)
                 continue
 
+            close_price = float(df["close"].iloc[-1])
+
             # ----------------------------------------------------------
-            # Step 3 — Signal
+            # Step 2 — Fetch current funding rate + recent history
             # ----------------------------------------------------------
-            signal = get_signal(df)
+            funding = fetch_current_funding()
+            recent  = fetch_recent_funding(count=10)
+
+            funding_data = None
+            if funding and funding.get("rate") is not None:
+                # Compute cumulative 24h from recent settled rates
+                cum_24h = recent["rate"].tail(3).sum() if not recent.empty else 0
+                funding_data = {
+                    "rate":        funding["rate"],
+                    "funding_24h": cum_24h,
+                }
+                print(f"  Funding  : {funding['rate']:+.6f} ({funding['rate']*100:+.4f}%)"
+                      f"  | 24h cumulative: {cum_24h:+.6f} ({cum_24h*100:+.4f}%)")
+            else:
+                print("  Funding  : unavailable")
+
+            # ----------------------------------------------------------
+            # Step 3 — Signal (funding extreme + price trigger)
+            # ----------------------------------------------------------
+            signal = get_signal(df, current_funding=funding_data)
             print(f"  Signal   : {signal['signal']}")
             print(f"  Reason   : {signal['reason']}")
 
             # ----------------------------------------------------------
-            # Step 4 — Risk validation (also fetches open positions)
+            # Step 4 — Risk validation
             # ----------------------------------------------------------
             balance        = _get_balance_usd(exchange, close_price)
             open_positions = _get_open_positions(exchange)
 
-            # ----------------------------------------------------------
-            # Step 4b — Detect position close, update exit log
-            # If we had an active order and positions are now empty,
-            # the trade has closed (TP / SL / liquidation / manual).
-            # ----------------------------------------------------------
+            # Detect position close
             if active_order_id and not open_positions:
                 print(f"\n  [EXIT] Position closed — order_id={active_order_id}")
                 exit_price  = _fetch_exit_price(exchange, active_order_id, close_price)
@@ -260,9 +219,8 @@ def main() -> None:
                 active_signal   = None
 
             risk_result = validate_signal(
-                signal         = signal,
-                account_balance= balance,
-                open_positions = open_positions,
+                signal=signal, account_balance=balance,
+                open_positions=open_positions,
             )
 
             approved = risk_result["approved"]
@@ -272,17 +230,11 @@ def main() -> None:
                 print(f"  Reason   : {risk_result['reason']}")
 
             # ----------------------------------------------------------
-            # Step 5 — Execute (only if risk approves)
+            # Step 5 — Execute
             # ----------------------------------------------------------
             if approved:
-                order_result = execute_signal(
-                    signal        = signal,
-                    validated_risk= risk_result,
-                )
+                order_result = execute_signal(signal=signal, validated_risk=risk_result)
 
-                # ----------------------------------------------------------
-                # Step 6 — Log entry; track order for exit detection
-                # ----------------------------------------------------------
                 trade_dict = {
                     "order_id":          order_result.get("order_id"),
                     "signal":            signal["signal"],
@@ -296,27 +248,20 @@ def main() -> None:
                 }
                 log_trade(trade_dict)
 
-                # Track for exit detection on subsequent loop iterations
                 if order_result.get("status") == "placed":
                     active_order_id = order_result.get("order_id")
                     active_signal   = signal
 
             # ----------------------------------------------------------
-            # Heartbeat + sleep decision
+            # Heartbeat + sleep
             # ----------------------------------------------------------
             retry     = _should_retry(order_result)
             elapsed   = time.time() - loop_start
             remaining = max(0.0, LOOP_SLEEP - elapsed)
-            sleep_msg = (
-                f"Retrying in {RETRY_SLEEP}s"
-                if retry else
-                f"Waiting for next candle in {remaining:.0f}s"
-            )
+            sleep_msg = (f"Retrying in {RETRY_SLEEP}s" if retry
+                         else f"Waiting for next candle in {remaining:.0f}s")
             _heartbeat(now_utc, signal, risk_result, order_result, sleep_msg)
 
-            # ----------------------------------------------------------
-            # Step 7 — Sleep: short retry on failure, full bar on success
-            # ----------------------------------------------------------
             if retry:
                 _sleep_retry()
             else:
@@ -326,32 +271,21 @@ def main() -> None:
         _shutdown()
 
 
-def _sleep_retry() -> None:
-    """Sleep RETRY_SLEEP seconds then fall back to the top of the loop.
-    Used when an order failed — the signal may still be valid, so we
-    re-fetch candles and re-evaluate rather than waiting a full 15 minutes.
-    """
+def _sleep_retry():
     print(f"\n  Retrying in {RETRY_SLEEP}s...")
     time.sleep(RETRY_SLEEP)
 
 
-def _sleep_to_next_bar(loop_start: float) -> None:
-    """Sleep for the remainder of the 15-minute candle period."""
+def _sleep_to_next_bar(loop_start):
     elapsed    = time.time() - loop_start
     sleep_secs = max(0.0, LOOP_SLEEP - elapsed)
-    print(
-        f"\n  Sleeping {sleep_secs:.0f}s  "
-        f"(execution took {elapsed:.1f}s of {LOOP_SLEEP}s bar)"
-    )
+    print(f"\n  Sleeping {sleep_secs:.0f}s  (execution took {elapsed:.1f}s of {LOOP_SLEEP}s bar)")
     time.sleep(sleep_secs)
 
 
-def _shutdown() -> None:
-    """Clean shutdown on Ctrl-C."""
+def _shutdown():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"\n\n[STOP] Bot stopped by user at {ts}  (KeyboardInterrupt)\n")
-
-    # Print final summary before exiting
     print("─" * 62)
     print("  Final session summary:")
     print_summary()
