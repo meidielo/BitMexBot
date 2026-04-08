@@ -307,11 +307,20 @@ def get_daily_signal(df: pd.DataFrame, i: int) -> dict:
 # Backtest loop — inverse PnL (BTC-margined)
 # ---------------------------------------------------------------------------
 
-def run_backtest(df: pd.DataFrame) -> dict:
+def run_backtest(df: pd.DataFrame, slippage_pct: float = None,
+                 slippage_exit_pct: float = None, quiet: bool = False) -> dict:
     """
     Walk daily bars, evaluate V4 signals, simulate LONG fills.
     XBTUSD inverse: all PnL in BTC.
+
+    SL/TP are recalculated from actual fill price (not signal close) to
+    preserve the intended risk distance and R:R ratio after slippage.
     """
+    if slippage_pct is None:
+        slippage_pct = SLIPPAGE_PCT
+    if slippage_exit_pct is None:
+        slippage_exit_pct = SLIPPAGE_EXIT_PCT
+
     trades   = []
     n        = len(df)
     i        = MIN_WARMUP
@@ -325,10 +334,11 @@ def run_backtest(df: pd.DataFrame) -> dict:
         "init_price": init_price,
     }
 
-    print(f"\nInitial equity: {balance_btc:.6f} BTC "
-          f"(${INITIAL_BALANCE:.2f} @ ${init_price:,.2f})")
-    print(f"Running V4 daily backtest on {n:,} bars "
-          f"(scan starts at index {MIN_WARMUP})...\n")
+    if not quiet:
+        print(f"\nInitial equity: {balance_btc:.6f} BTC "
+              f"(${INITIAL_BALANCE:.2f} @ ${init_price:,.2f})")
+        print(f"Running V4 daily backtest on {n:,} bars "
+              f"(scan starts at index {MIN_WARMUP})...\n")
 
     while i < n - 1:
         sig = get_daily_signal(df, i)
@@ -341,12 +351,18 @@ def run_backtest(df: pd.DataFrame) -> dict:
         fill_idx   = i + 1
         fill_ts    = df.index[fill_idx]
         raw_open   = float(df.iloc[fill_idx]["open"])
-        fill_price = raw_open * (1 + SLIPPAGE_PCT)  # LONG: pay more
-        sl_price   = float(sig["sl_price"])
-        tp_price   = float(sig["tp_price"])
+        fill_price = raw_open * (1 + slippage_pct)  # LONG: pay more
 
-        # Gap check — if next-day open already below SL, skip
-        if fill_price <= sl_price:
+        # Recalculate SL/TP from actual fill price (not signal close).
+        # This preserves the intended ATR-based risk distance and R:R
+        # ratio regardless of how much slippage was incurred.
+        atr = float(df.iloc[i]["atr"])
+        sl_dist = atr * SL_ATR_MULT
+        sl_price = fill_price - sl_dist
+        tp_price = fill_price + (sl_dist * TARGET_RR)
+
+        # Sanity: SL must be above zero
+        if sl_price <= 0:
             i += 1
             continue
 
@@ -356,10 +372,10 @@ def run_backtest(df: pd.DataFrame) -> dict:
 
         # Apply exit slippage (adverse = lower for LONG exit)
         if outcome in ("SL", "TP"):
-            exit_price = exit_price_raw * (1 - SLIPPAGE_EXIT_PCT)
+            exit_price = exit_price_raw * (1 - slippage_exit_pct)
         else:
             # OPEN — closing at last bar's close, still slipped
-            exit_price = exit_price_raw * (1 - SLIPPAGE_EXIT_PCT)
+            exit_price = exit_price_raw * (1 - slippage_exit_pct)
 
         exit_ts       = df.index[exit_idx]
         duration_days = (exit_ts - fill_ts).days
@@ -411,14 +427,15 @@ def run_backtest(df: pd.DataFrame) -> dict:
         trades.append(trade)
 
         tag = " WIN" if outcome == "TP" else ("LOSS" if outcome == "SL" else "OPEN")
-        print(
-            f"  [{len(trades):3d}] {fill_ts.strftime('%Y-%m-%d')} "
-            f"LONG  {tag}  "
-            f"R={r_multiple:+.2f}  PnL={pnl_btc:+.6f} BTC  "
-            f"Bal={balance_btc:.6f} BTC (${bal_usd_ref:>9,.2f})  "
-            f"LiqL={sig.get('liq_long_ratio', 0):.1f}× "
-            f"OIΔ={sig.get('oi_delta_pct', 0)*100:+.1f}%"
-        )
+        if not quiet:
+            print(
+                f"  [{len(trades):3d}] {fill_ts.strftime('%Y-%m-%d')} "
+                f"LONG  {tag}  "
+                f"R={r_multiple:+.2f}  PnL={pnl_btc:+.6f} BTC  "
+                f"Bal={balance_btc:.6f} BTC (${bal_usd_ref:>9,.2f})  "
+                f"LiqL={sig.get('liq_long_ratio', 0):.1f}× "
+                f"OIΔ={sig.get('oi_delta_pct', 0)*100:+.1f}%"
+            )
 
         i = exit_idx + 1
 
@@ -536,6 +553,135 @@ def save_csv(trades, path):
 
 
 # ---------------------------------------------------------------------------
+# Slippage sweep — stress test across catastrophic slippage levels
+# ---------------------------------------------------------------------------
+
+def run_slippage_sweep(df: pd.DataFrame):
+    """
+    Run V4 backtest at escalating slippage levels to find the breakeven
+    where PF drops below 1.0 and the edge disappears.
+
+    Tests both percentage-based slippage AND R-term equivalents.
+    With SL = 2× ATR, 0.5R slippage = 1× ATR ≈ 2-4% of price.
+    """
+    w = 72
+    print("\n" + "=" * w)
+    print("  SLIPPAGE STRESS TEST — V4 Catastrophic Scenario Analysis")
+    print("  SL/TP recalculated from actual fill price (not signal close)")
+    print("=" * w)
+
+    # Percentage-based sweep: 0% to 5% entry slippage
+    # Exit slippage scales proportionally (1/3 of entry)
+    pct_levels = [0.0, 0.001, 0.003, 0.005, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05]
+
+    print(f"\n  {'Slip%':>6} {'ExitSlip':>8} {'Trades':>7} {'WR':>6} "
+          f"{'PF':>7} {'AvgR':>7} {'BTC Ret':>8} {'MaxDD':>7}  R-cost")
+    print(f"  {'-'*72}")
+
+    breakeven_pct = None
+    last_pf = None
+
+    for slip in pct_levels:
+        exit_slip = slip / 3.0  # exit slippage ~1/3 of entry
+        result = run_backtest(df, slippage_pct=slip, slippage_exit_pct=exit_slip,
+                              quiet=True)
+        trades = result["trades"]
+
+        if not trades:
+            print(f"  {slip*100:>5.1f}% {exit_slip*100:>7.2f}%   0 trades — all gapped past SL")
+            continue
+
+        total = len(trades)
+        wins = sum(1 for t in trades if t["outcome"] == "TP")
+        losses = sum(1 for t in trades if t["outcome"] == "SL")
+        wr = wins / total * 100
+
+        gross_profit = sum(t["pnl_btc"] for t in trades if t["outcome"] == "TP")
+        gross_loss = abs(sum(t["pnl_btc"] for t in trades if t["outcome"] == "SL"))
+        pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+        avg_r = sum(t["actual_r"] for t in trades) / total
+        init_btc = result["meta"]["init_btc"]
+        final_btc = trades[-1]["balance_btc"]
+        btc_ret = (final_btc - init_btc) / init_btc * 100
+        max_dd = max(t["drawdown_pct"] for t in trades)
+
+        # Estimate R-cost of slippage: compare avg_r to frictionless
+        r_cost_note = ""
+        if slip == 0:
+            frictionless_avg_r = avg_r
+        else:
+            r_cost = frictionless_avg_r - avg_r
+            r_cost_note = f"  -{r_cost:.2f}R"
+
+        marker = ""
+        if last_pf is not None and last_pf >= 1.0 and pf < 1.0:
+            breakeven_pct = slip
+            marker = "  ← BREAKEVEN"
+        last_pf = pf
+
+        print(f"  {slip*100:>5.1f}% {exit_slip*100:>7.2f}%  "
+              f"{total:>3}/{total}  {wr:>4.0f}%  "
+              f"{pf:>6.2f}  {avg_r:>+5.2f}R  {btc_ret:>+6.1f}%  {max_dd:>5.1f}%"
+              f"{r_cost_note}{marker}")
+
+    # R-term analysis
+    print(f"\n  {'─'*72}")
+    print(f"  R-TERM EQUIVALENTS (SL = {SL_ATR_MULT}× ATR)")
+    print(f"  {'─'*72}")
+
+    # Calculate average ATR and price across the 4 signals to show R→% mapping
+    # Use the sweep results to identify exact breakeven
+    if breakeven_pct is not None:
+        print(f"\n  ⚠ BREAKEVEN at {breakeven_pct*100:.1f}% entry slippage (PF < 1.0)")
+        print(f"    At SL = {SL_ATR_MULT}× ATR, this equals ~{breakeven_pct / (SL_ATR_MULT * 0.03):.2f}R")
+    else:
+        if last_pf is not None and last_pf >= 1.0:
+            print(f"\n  Edge survives up to {pct_levels[-1]*100:.0f}% slippage (PF={last_pf:.2f})")
+        else:
+            print(f"\n  Edge already broken at lowest tested level")
+
+    # Fine-grained binary search around breakeven
+    if breakeven_pct is not None:
+        _find_precise_breakeven(df, breakeven_pct)
+
+
+def _find_precise_breakeven(df: pd.DataFrame, approx_pct: float):
+    """Binary search to find exact slippage % where PF crosses 1.0."""
+    lo = approx_pct * 0.5  # search below
+    hi = approx_pct * 1.5  # search above
+    print(f"\n  Fine-tuning breakeven (binary search {lo*100:.2f}%–{hi*100:.2f}%)...")
+
+    for _ in range(10):
+        mid = (lo + hi) / 2
+        exit_slip = mid / 3.0
+        result = run_backtest(df, slippage_pct=mid, slippage_exit_pct=exit_slip,
+                              quiet=True)
+        trades = result["trades"]
+        if not trades:
+            hi = mid
+            continue
+
+        gross_profit = sum(t["pnl_btc"] for t in trades if t["outcome"] == "TP")
+        gross_loss = abs(sum(t["pnl_btc"] for t in trades if t["outcome"] == "SL"))
+        pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+        if pf >= 1.0:
+            lo = mid
+        else:
+            hi = mid
+
+    breakeven = (lo + hi) / 2
+    # Convert to R-terms: slippage_pct * price ≈ slippage_pct / (ATR/price * SL_ATR_MULT) in R
+    # Approximate: for XBTUSD, ATR/price ≈ 3% (historical), so SL dist ≈ 6%
+    # R_cost ≈ slippage_pct / (ATR/price * SL_ATR_MULT)
+    print(f"\n  PRECISE BREAKEVEN: {breakeven*100:.3f}% entry slippage")
+    print(f"    Exit slippage:  {breakeven/3*100:.3f}%")
+    print(f"    At avg ATR/price ~3%, SL dist ~{SL_ATR_MULT*3:.0f}%: "
+          f"≈ {breakeven/(0.03*SL_ATR_MULT):.2f}R slippage cost")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -543,6 +689,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="V4 Trend-Following Liq Dip-Buy Backtest")
     parser.add_argument("--refresh", action="store_true",
                         help="Force fresh fetch from APIs (skip cache)")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Run slippage stress test across catastrophic levels")
     args = parser.parse_args()
 
     use_cache = not args.refresh
@@ -562,19 +710,20 @@ if __name__ == "__main__":
     print(f"    SL:           {SL_ATR_MULT}× ATR({ATR_PERIOD})")
     print(f"    TP:           {TARGET_RR}× risk")
     print(f"    Slippage:     {SLIPPAGE_PCT*100:.1f}% entry, {SLIPPAGE_EXIT_PCT*100:.1f}% exit")
+    print(f"    SL/TP basis:  Recalculated from fill price (not signal close)")
     print()
 
     # Build dataset
     df = build_daily_dataset(use_cache=use_cache)
 
-    # Run backtest
-    result = run_backtest(df)
-    trades = result["trades"]
-    meta   = result["meta"]
-
-    # Report
-    print_report(trades, meta)
-
-    # Save
-    out_path = os.path.join(OUTPUT_DIR, "backtest_v4_daily.csv")
-    save_csv(trades, out_path)
+    if args.sweep:
+        # Slippage stress test
+        run_slippage_sweep(df)
+    else:
+        # Standard backtest
+        result = run_backtest(df)
+        trades = result["trades"]
+        meta   = result["meta"]
+        print_report(trades, meta)
+        out_path = os.path.join(OUTPUT_DIR, "backtest_v4_daily.csv")
+        save_csv(trades, out_path)

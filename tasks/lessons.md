@@ -47,3 +47,69 @@
 ## L10: Protect the data pipeline above all else
 **Context:** 15m forward collector is building a data moat that Coinalyze won't retain (21-day rolling window). Every missed interval is permanently lost data.
 **Rule:** Heartbeat file for external monitoring. Structured logging to DB. Request timeouts and retries. WAL + busy_timeout for crash safety. Check integrity periodically. The strategy can be redesigned; lost data cannot be recovered.
+
+## L11: Slippage is not a constant — it's a function of order book destruction
+**Context:** V4 backtest used 0.3% fixed slippage. User: "Your cost matrix is a fantasy. During a liquidation cascade, the bid side is annihilated. Market impact is an order of magnitude higher."
+**Correction:** Fixed slippage is a lie during cascade events. The order book is depleted by the liquidation engine before your order arrives. Slippage is a dynamic function of position size × instantaneous liquidity, not a static percentage.
+**Rule:** Always stress-test at catastrophic slippage (0.5R–0.8R). V4 breakeven: 3.26% entry slippage (≈0.54R). Below that, the edge survives. Above it, the edge was an illusion.
+
+## L12: SL/TP must be anchored to fill price, not signal price
+**Context:** V4 calculated SL/TP from signal day close, but actual entry was next-day open + slippage. With large slippage, fill was far from signal close, making SL distance larger and TP distance smaller than intended — silently degrading R:R.
+**Rule:** Always recalculate SL and TP from the executed fill price. This preserves the intended ATR-based risk distance and R:R ratio regardless of slippage magnitude. Position sizing uses actual fill-to-SL distance.
+
+## L13: Sharp cliffs in parameter sweeps are sample-size artifacts, not market features
+**Context:** V4 slippage sweep showed PF 1.26 at 3.0% → PF 0.39 at 4.0%. Looks like a "cliff." In reality, with N=4 trades, the entire system's profitability hinges on one winning trade surviving its TP before SL. When slippage crosses the threshold that flips that single trade, the whole system dies instantly.
+**Rule:** A robust strategy distributes returns across dozens of trades. If profitability depends on one or two specific trades navigating a narrow window, you have a fragile anomaly, not a tradeable edge. Do not deploy capital until N≥200 validates the distribution.
+
+## L14: Entry slippage and exit slippage are asymmetric by nature
+**Context:** Entries occur during liquidity vacuums (cascade events). Exits occur during normal market conditions (SL/TP hit days or weeks later). Modeling exit slippage as a fraction of entry slippage (~1/3) is structurally correct — the order book has rebuilt by exit time.
+**Rule:** Never use symmetric slippage models. Entry during cascade = high impact. Exit during normal conditions = low impact. The 1/3 ratio is a reasonable heuristic for daily-timeframe trend-following.
+
+## L15: Correlated assets do not provide independent samples
+**Context:** Proposed adding ETH/SOL cascades to V4 to increase N. User: "During extreme leverage washouts, correlation across major crypto approaches 1.0. You are not increasing your sample size; you are just artificially inflating your trade count."
+**Rule:** Adding correlated instruments to a macro strategy does not increase statistical power. If BTC cascades, ETH/SOL cascade simultaneously. N stays the same — you just have leveraged exposure to the same event.
+
+## L16: Monte Carlo requires a representative seed distribution
+**Context:** Proposed generating synthetic cascades from N=4 real events. User: "You cannot run a Monte Carlo simulation using an initial seed of four events. Perturbing four random wicks will only map the curve-fitted fantasy of your existing confirmation bias."
+**Rule:** Monte Carlo is only valid when the seed distribution is representative of the population. With N=4, you have no idea what the tails look like. Synthetic perturbation of a tiny sample produces statistically meaningless results.
+
+## L17: Building a better radar does not make more planes take off
+**Context:** Proposed real-time cascade detection to "generate forward data points immediately." User: "A real-time detector does not cause cascades to happen. If the market produces 1.3 cascades per year, your system will sit silent for 364 days."
+**Rule:** Do not confuse detection infrastructure with event frequency. A low-frequency macro strategy generates low-frequency signals regardless of how sophisticated the detection system is. To solve the N problem, you must target a high-frequency structural edge.
+
+## L18: To solve N fast, target high-frequency mechanical edges
+**Context:** V4 fires ~1.3 times/year. Reaching N=200 would take 150 years. User: "You must target a structural inefficiency that occurs at a high frequency. Funding is settled every 8 hours — 1,095 times a year."
+**Rule:** When the bottleneck is sample size, pivot to a mechanically recurring market event. Funding settlement (3× daily) provides 1,095 independent events/year. N=200 is achievable in ~2 months. The edge may be smaller, but it's provable.
+
+## L19: Publicly scheduled timestamps are fully arbitraged by HFT
+**Context:** Funding settlement study showed 3.45× volume spike pre-settlement (mechanism is real) but zero tradeable price edge (p>0.05 on directional tests, win rates ~50%). Extreme funding events clustered in 2020-2021, near-zero in 2023+.
+**Correction:** Market makers front-run the publicly scheduled settlement time, widen quotes, absorb the volume, and neutralize the price impact. Competing against latency arbitrageurs on a known timestamp is guaranteed loss.
+**Rule:** Never build a strategy around a publicly scheduled, precisely timestamped market event. Institutional HFT has already internalized the risk. The mechanism exists; the edge does not.
+
+## L20: Correlation is not co-integration
+**Context:** Transitioning to pairs/statistical arbitrage. Two assets can be highly correlated (move in the same direction) yet drift infinitely apart in absolute value.
+**Rule:** Pairs trading requires co-integration (Engle-Granger or Johansen test), not correlation. Co-integration guarantees the spread is stationary (mean-reverting). Trading a correlated-but-not-co-integrated spread leads to catastrophic drawdowns.
+
+## L21: Major crypto pairs are correlated but not co-integrated
+**Context:** Tested BTC/ETH, ETH/SOL, LTC/BTC, DOGE/XRP, LINK/ETH. All Hurst exponents ≈ 0.97 (deep trending). LTC/BTC passed EG (p=0.028) and Johansen but Hurst = 0.965 kills it. BTC/ETH is not even close (EG p=0.84).
+**Rule:** Major crypto spreads drift with the macro cycle. They are directionally correlated but not level-stationary. Pairs trading in crypto requires either micro-cap structural pairs (protocol tokens with locked economic relationships) or cross-exchange arb, not cross-asset mean reversion on majors.
+
+## L22: Hurst exponent is symmetrical — H > 0.5 validates momentum, not just invalidates mean-reversion
+**Context:** Dismissed H ≈ 0.97 as "pairs trading fails." User: "A 160 IQ quant looks at H=0.97 and says 'this is one of the strongest persistence signals in modern finance.'"
+**Rule:** H < 0.5 → mean-reversion (pairs). H > 0.5 → momentum (trend-following). H ≈ 0.97 across crypto spreads proves cross-sectional momentum is the structural inefficiency, not stat arb. Do not discard data because one thesis failed — invert the signal.
+
+## L23: Chasing new alphas is procrastination when execution infrastructure is missing
+**Context:** Ran funding settlement study and co-integration study instead of building V4 execution layer. Both studies were intellectually interesting but operationally irrelevant to deploying the only validated edge.
+**Rule:** Strategy generation without execution capability is academic tourism. If you have a validated edge with a running data collector, the highest-EV engineering task is always the execution pipeline — not the next backtest.
+
+## L24: When reducing turnover kills the return, the signal is noise not momentum
+**Context:** Cross-sectional momentum backtest showed Sharpe 0.58 with 77% weekly turnover. Adding a 15% rank buffer cut turnover to 60% but Sharpe collapsed to 0.20, return from +45.8% to +7.5%. The "alpha" was short-term reversal churn, not structural momentum.
+**Rule:** If dampening rebalance frequency destroys PnL, the signal is high-frequency noise that the algorithm was accidentally timing. True momentum persists through buffer periods. Test this by varying rebalance frequency before deploying.
+
+## L25: Derivative universes are too curated for cross-sectional strategies
+**Context:** BitMEX only lists perps for assets with massive existing liquidity. The 30-40 eligible symbols are structurally homogeneous (CSD stable at 7-9% across all regimes). True cross-sectional dispersion lives in micro-cap spot markets, not large-cap derivatives.
+**Rule:** Cross-sectional strategies need large, diverse universes with genuine dispersion. A curated derivative exchange universe is too correlated and too arbitraged. CSD was -0.114 correlated with returns — completely independent.
+
+## L26: Systematic elimination is the real product
+**Context:** Killed V1-V3 indicators, V2 funding mean-reversion, V3 triple-condition, funding settlement arb, pairs/stat-arb, and cross-sectional momentum. Only V4 macro dip-buy survived.
+**Rule:** The value of rigorous testing is not finding winners — it's confidently eliminating losers before they consume capital. Every dead strategy is a prevented loss. The survivor is stronger for having been the last one standing.
