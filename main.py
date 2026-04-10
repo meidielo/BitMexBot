@@ -20,8 +20,11 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from bitmex_client  import get_client
+from condition_logger import get_logger as get_condition_logger, log_v2_conditions
 from fetch_data     import fetch_ohlcv, fetch_current_funding, fetch_recent_funding
-from signals        import get_signal
+from signals        import (get_signal, FUNDING_THRESHOLD, FUNDING_24H_THRESH,
+                            VOLUME_SPIKE_MULT, VOLUME_LOOKBACK,
+                            USE_SETTLEMENT_FILTER, _in_settlement_window)
 from risk           import validate_signal
 from order_manager  import execute_signal
 from logger         import log_trade, update_trade_exit
@@ -202,6 +205,35 @@ def main() -> None:
             signal = get_signal(df, current_funding=funding_data)
             print(f"  Signal   : {signal['signal']}")
             print(f"  Reason   : {signal['reason']}")
+
+            # -- Condition telemetry --
+            try:
+                cond_conn = get_condition_logger()
+                curr = df.iloc[-1]
+                prev = df.iloc[-2]
+                vol = float(curr["volume"])
+                vol_avg = float(df["volume"].iloc[-(VOLUME_LOOKBACK + 1):-1].mean())
+                vol_ratio = vol / vol_avg if vol_avg > 0 else 0
+                fr = funding_data.get("rate") if funding_data else None
+                f24 = funding_data.get("funding_24h") if funding_data else None
+                in_window = (_in_settlement_window(df.index[-1])
+                             if USE_SETTLEMENT_FILTER else None)
+                log_v2_conditions(
+                    cond_conn,
+                    funding_rate=fr,
+                    funding_threshold=FUNDING_THRESHOLD,
+                    funding_24h=f24,
+                    funding_24h_threshold=FUNDING_24H_THRESH,
+                    in_settlement_window=in_window,
+                    volume_ratio=vol_ratio,
+                    volume_threshold=VOLUME_SPIKE_MULT,
+                    bearish_break=float(curr["close"]) < float(prev["low"]),
+                    bullish_break=float(curr["close"]) > float(prev["high"]),
+                    body_pct=abs(float(curr["close"]) - float(curr["open"])) / float(curr["close"]) if float(curr["close"]) > 0 else 0,
+                    body_threshold=0.0005,
+                )
+            except Exception:
+                pass  # telemetry must never break the trading loop
 
             # ----------------------------------------------------------
             # Step 4 — Risk validation

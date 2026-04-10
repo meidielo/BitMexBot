@@ -113,3 +113,160 @@
 ## L26: Systematic elimination is the real product
 **Context:** Killed V1-V3 indicators, V2 funding mean-reversion, V3 triple-condition, funding settlement arb, pairs/stat-arb, and cross-sectional momentum. Only V4 macro dip-buy survived.
 **Rule:** The value of rigorous testing is not finding winners — it's confidently eliminating losers before they consume capital. Every dead strategy is a prevented loss. The survivor is stronger for having been the last one standing.
+
+## L27: Infrastructure ≠ statistical validity (external audit, 2026-04-08)
+**Context:** External audit found 16 items. Core finding: V4 has N=4 trades — PF 1.54 with 95% CI spanning 0.3 to 12+. Cannot distinguish edge from luck. OI filter may be overfitting (searched within N=6 for a better subset of 4). No OOS data was reserved. 15m execution loop contradicts 2-10 minute cascade thesis.
+**Rule:** No amount of engineering excellence compensates for insufficient statistical evidence. Pre-register parameters before pulling new data. Expand sample via free historical sources (BitMEX public dumps 2016+, Binance OI) before considering mainnet deployment. Walk-forward validation mandatory. Log condition distances every loop — it's free forward data you're otherwise discarding.
+
+## L30: V2 signal audit — funding regime structurally died mid-2024 (2026-04-09)
+
+**Context:** Pre-Path-X audit of V2 signal (funding rate mean-reversion).
+Question: is V2 broken or correctly strict? Ran `v2_signal_audit.py`
+against 6,860 funding settlements (2020-01-01 → 2026-04-05, full XBTUSD
+cache).
+
+**Result — V2 is NOT broken. Fired 292 times historically at 0.05%
+threshold. The signal logic is sound. The underlying regime died.**
+
+Year-by-year % of settlements with |funding| >= 0.05%:
+```
+  2020: 8.7%   (95 fires — COVID crash + PlusToken era)
+  2021: 11.9%  (130 fires — bull top retail euphoria)
+  2022: 1.3%   (14 fires — post-LUNA deleveraging)
+  2023: 1.6%   (18 fires — ETF accumulation phase)
+  2024: 3.2%   (35 fires — halving + launch FOMO)
+  2025: 0.1%   (1 fire  — STRUCTURAL DEATH)
+  2026: 0.0%   (0 fires — max rate all year = 0.010%)
+```
+
+Max funding rate has collapsed from ±0.30% in 2021 to ±0.0569% in 2025
+to ±0.0100% in 2026. Not a cyclical dip — a structural compression.
+
+**Direction asymmetry:** 75.5% of ALL settlements are positive funding.
+SHORT setups outnumber LONG setups 2.5:1 at 0.05% threshold. V2 was
+always structurally a short-dominant strategy.
+
+**Why regime died (hypothesis):** Institutional spot-perp basis trading
+became mainstream in 2023. Funding rate edge has been fully arbitraged
+by delta-neutral cash-and-carry funds. Matches L19 (publicly scheduled
+mechanics get arbitraged) but extends it — even the underlying SETUP
+CONDITION is compressed now, not just the tradeable edge.
+
+**Rule:** Funding-rate-based strategies on BTC perpetuals are effectively
+dead post-2024 regardless of specific thesis (mean-reversion, exhaustion,
+settlement arb). The raw signal input — extreme funding — no longer
+occurs. This applies across V2 (mean-reversion), V3 triple-condition,
+V4 funding setup (also died — see year table, 0.03% threshold has only
+7 fires in last 12m), and any planned Path X funding exhaustion strategy.
+
+**Path X implication:** Before committing to funding exhaustion, note
+that 0.03% setup level fires 7x in last 12m total. Any "N consecutive
+settlements above threshold" rule will return N≈0 on recent data.
+Path X would need to test on 2020-2022 data (where the regime existed)
+and accept that the thesis may be historically valid but currently
+unexploitable — same problem V4 has.
+
+**Meta-finding:** This is the third strategy family confirmed dead by
+regime change rather than flawed thesis. V4 (cascade dip-buy) needs
+bull regime events that don't happen often enough. V2 (funding
+mean-reversion) needs funding extremes that no longer occur. Vol regime
+(L29) needs mean-reverting vol events that stopped mean-reverting.
+A pattern: every dead strategy was thesis-valid in historical data
+but broken in 2024-2026 market structure.
+
+## L29: Vol Regime Mean-Reversion — DEAD (with salvage attempt) (2026-04-09)
+
+**Thesis (V1):** Realized vol spike > 2σ above 90-day mean, then contraction
+back to mean = directional entry. EMA200 for regime filter. Long in bull,
+short in bear.
+
+**V1 Result:** N=52, PF=0.95, Total R=-1.79, Max DD=-14.27R.
+OOS N=30, Total R=-3.53 across 3 meaningful folds.
+BULL WR 40% / BEAR WR 8.3% — looked like EMA200 had predictive power.
+
+**Why V1 died:** Vol normalization tells you THAT vol is contracting, not
+WHICH WAY price will move. Profitable in exactly one fold (2023-10 to
+2025-01, steady bull run) — regime-dependent luck, not edge. In fold 3
+(2025, also bull regime), 7/8 trades stopped out into sideways topping.
+
+**Salvage attempt (V2 — 3 directional hypotheses tested):**
+
+| Hypothesis | Rule | N | PF | Full R | OOS R |
+|---|---|---|---|---|---|
+| H1 Direction A | bull+fear→LONG, bear+blow-off→SHORT | 16 | 0.65 | -4.20 | -2.10 |
+| H2 Always LONG | ignore regime, always long contraction | 53 | 1.28 | +9.20 | +1.47 |
+| H2b Bear-only LONG | salvage hypothesis, bear regime only | 13 | 1.23 | +1.83 | -1.11 |
+| H3 V1 Baseline | long bull / short bear | 52 | 0.95 | -1.79 | -3.53 |
+
+**Key structural finding:** Vol spike quadrant distribution is asymmetric:
+  - Bull+fear spikes: 16 (corrections in uptrends)
+  - Bull+blow-off spikes: 44 (majority — FOMO tops)
+  - Bear+fear spikes: 35 (capitulation)
+  - Bear+blow-off spikes: 2 (dead cat bounces — essentially non-existent)
+
+Direction A (H1) fails because bear+blow-off barely exists, and bull+fear
+corrections don't reliably recover at 3R targets.
+
+**Most interesting finding (H2):** "Always LONG on contraction" produces
+PF 1.28 and positive OOS R=+1.47 — the FIRST positive OOS result in this
+project. But fold 3 (2025-01→2026-04) collapses to -6.15R on 9 trades.
+Both H2 and H3 lose fold 3, suggesting recent market structure (tariff
+volatility, repeated re-spiking) broke the mean-reversion assumption.
+
+**False salvage:** The initial "91.7% bear flip" observation was artifact.
+Multiplying r_multiple by -1 assumes the flipped trade exits at the same
+bar as the original. Real long/short pairs track differently through
+TP/SL brackets. Proper re-simulation (H2b) showed bear-longs had WR 38.5%,
+not 91.7%. Lesson: never trust a "what-if flipped" analysis without
+re-running the actual trade simulation.
+
+**Infrastructure gain:** First strategy in this project to achieve N=52
+in backtest with meaningful walk-forward. The 5m OHLCV → daily realized
+vol pipeline works, walk-forward framework works, pre-registration
+workflow works. All reusable.
+
+**Rule:** Vol contraction alone is a timing signal, not a directional one.
+Any vol-based strategy needs either (a) a separate directional signal
+independent of vol shape, or (b) options implementation where direction
+doesn't matter. The "fear vs blow-off" decomposition doesn't work because
+the quadrants are too asymmetric. Don't revive this thesis without a
+genuinely independent direction feature — and even then, the fold-3
+collapse suggests vol-regime strategies may be structurally broken in
+post-2024 BTC markets where vol events don't mean-revert cleanly.
+
+**Fold-3 autopsy (2026-04-09) — final nail:**
+
+Pre-committed kill rule: filter must catch >=6/8 fold-3 losses AND remove
+<3 of 20 folds 1+2 winners. Five hypotheses tested:
+
+| # | Hypothesis | Best losses caught | F1+2 wins removed | Pass? |
+|---|---|---|---|---|
+| A | Vol re-spike within 5d | 1/8 | 8/20 | NO |
+| B | ATR ratio >1.3-2.0x | 3/8 (@1.3) | 13/20 | NO |
+| C | Calendar cluster | max 2/mo | — | NO |
+| D | Weak contraction (vol_z > -0.75) | 7/8 | 19/20 | NO (kill switch, not filter) |
+| E | Fast stop-out <=3d | 1/8 | — | NO |
+
+**ZERO hypotheses cleared the bar.** Fold-3 losses were:
+- Evenly spread (no calendar clustering)
+- At normal ATR levels (not regime-too-wide)
+- Held for normal durations (median 9d, same as winners)
+- Uncorrelated with subsequent vol re-spikes
+
+The losses are **structurally indistinguishable from the winners** on
+every feature available. This is what noise looks like. The vol-regime
+family is CLOSED. No H3. No further iteration.
+
+**Meta-lesson (process):** Pre-committing the kill rule before looking at
+data prevented spawning a third iteration on the second miss. Without the
+rule, Hypothesis D (7/8 losses caught!) would have looked like a
+discovery instead of the kill switch it actually is. The rule worked.
+Use this pattern for every salvage attempt going forward.
+
+## L28: Free historical liquidation data has a hard ceiling (2026-04-09)
+**Context:** Implemented audit's recommendation to expand backtest to 2019-2026 via "BitMEX public dumps + Binance free API". Reality:
+  1. **BitMEX public dumps DO NOT contain liquidation flags** — only `trdType=Regular` in trade.csv. The audit was wrong about this.
+  2. **Binance Futures API is geo-blocked** in this region (HTTP 403). Bybit also blocks (TLS handshake failure).
+  3. **Coinalyze daily data already extends to 2023-04-07** — we've been using everything available (1096 days, ~3 years).
+  4. **Walk-forward on 3 years of data with N=4 trades** produces 1 OOS trade across 4 rolling folds. Statistically meaningless.
+**Rule:** Free historical liquidation data effectively maxes out at ~3 years via Coinalyze. Going further requires either paid services (CryptoQuant ~$50/mo) or building from current point forward. The audit's "expand sample size" path is blocked at the data layer for free options. The only honest paths to more N: (a) buy historical data, (b) wait for forward data accumulation, (c) cross-asset replication if exchanges aren't geo-blocked, (d) test mechanism components on non-liquidation data with larger N.

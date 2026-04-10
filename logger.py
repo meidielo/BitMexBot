@@ -44,9 +44,11 @@ CREATE TABLE IF NOT EXISTS trades (
 # ---------------------------------------------------------------------------
 
 def _connect() -> sqlite3.Connection:
-    """Return a connection with row-factory set for dict-style access."""
+    """Return a connection with WAL mode + busy_timeout for concurrent access."""
     os.makedirs(DB_DIR, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     return conn
 

@@ -1,21 +1,21 @@
 # BitMexBot
 
-A BitMEX testnet trading bot built as a learning project. Python 3.12, ccxt, pandas, pandas-ta.
+A BitMEX testnet trading bot built as a learning project. Python 3.12, ccxt, pandas.
 
 ## What It Does
 
-Runs a 15-minute loop: fetch candles from mainnet (public data) -> compute indicators -> evaluate 4 strategies -> validate risk -> execute orders on testnet -> log to SQLite.
+Runs a 15-minute loop: fetch candles from mainnet (public data) -> evaluate V2 Funding Rate Mean-Reversion signal -> validate risk -> execute orders on testnet -> log to SQLite + condition telemetry.
 
-## Strategies
+V4 Cascade Dip-Buy runs as a separate systemd service with adaptive 1-min/15-min polling.
 
-| Priority | Strategy | Type | Entry Condition |
-|----------|----------|------|-----------------|
-| S1 | EMA Rejection | Trend-following | Established EMA20/50 trend + rejection candle with wick confirmation |
-| S2 | BB Bounce | Mean-reversion | Price pierces Bollinger Band + RSI extreme + confirming candle body |
-| S3 | EMA Crossover | Trend change | EMA20 crosses EMA50 + confirming candle body |
-| S4 | RSI Reversal | Mean-reversion | RSI exits oversold (<30) or overbought (>70) + confirming body |
+## Current Strategy Status
 
-First strategy to match wins. All share the same SL/TP calculation and risk validation.
+| Strategy | File | Status |
+|----------|------|--------|
+| V2 Funding Rate Mean-Reversion | `signals.py` | Live on `main.py`, regime-silent since mid-2024 (L30) |
+| V4 Cascade Dip-Buy | `v4_execution.py` | Separate systemd service, data-blocked at N=4 |
+
+8 strategy families systematically tested and killed. See `tasks/lessons.md` L01-L30 and `CLAUDE.md` Strategy Graveyard for full history.
 
 ## Risk Controls
 
@@ -31,8 +31,6 @@ First strategy to match wins. All share the same SL/TP calculation and risk vali
 ## Quick Start
 
 ```bash
-# Clone and setup
-git clone https://github.com/meidielo/BitMexBot.git
 cd BitMexBot
 python3 -m venv venv
 source venv/bin/activate
@@ -40,7 +38,7 @@ pip install -r requirements.txt
 
 # Configure
 cp .env.example .env
-# Edit .env with your BitMEX testnet API keys
+# Edit .env with your BitMEX testnet API keys + dashboard credentials
 
 # Run
 python main.py
@@ -49,30 +47,33 @@ python main.py
 ## Architecture
 
 ```
-main.py              15-minute loop orchestrator
+main.py              V2 15-minute loop orchestrator
   |
   +-- fetch_data.py        5m OHLCV from mainnet, resampled to 15m
-  +-- indicators.py        EMA20, EMA50, RSI14, Bollinger Bands (20,2)
-  +-- signals.py           4 strategies (S1 > S2 > S3 > S4 priority)
+  +-- signals.py           V2: Funding Rate Mean Reversion (single strategy)
   +-- risk.py              6-rule risk filter (vetoes unsafe signals)
   +-- order_manager.py     Place orders with SL/TP on testnet
   +-- logger.py            SQLite trade logging
+  +-- condition_logger.py  Per-condition telemetry every loop
   +-- monitor.py           Daily summary
+
+v4_execution.py      V4 standalone service (separate systemd)
+  +-- coinalyze_collector.py  15m OI + liquidation data collector
 ```
 
 ## Other Tools
 
 | Script | Purpose |
 |--------|---------|
-| `dashboard.py` | Flask web dashboard (port 5000) |
-| `backtest.py` | Replay strategies against historical data |
-| `param_sweep.py` | Grid search over strategy parameters |
-| `ml_filter.py` | Optional RandomForest signal filter |
+| `dashboard.py` | Flask web dashboard (auth required, port 5000) |
+| `backtest.py` | V2 funding rate backtest |
+| `backtest_v3.py` | V4 daily backtest |
+| `mainnet_monitor.py` | Read-only mainnet V4 condition monitor |
 
 ## Tests
 
 ```bash
-python -m pytest test_risk.py test_signals.py -v   # 55 tests
+python -m pytest test_risk.py test_signals.py test_v4_recovery.py -v   # 53 tests
 ```
 
 ## Exchange Details

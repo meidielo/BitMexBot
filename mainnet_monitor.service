@@ -1,0 +1,16 @@
+[Unit]
+Description=BitMEX Mainnet V4 Condition Monitor (Read-Only)
+After=network.target
+
+[Service]
+User=meidie
+WorkingDirectory=/home/meidie/BitMexBot
+ExecStart=/home/meidie/BitMexBot/venv/bin/python -u mainnet_monitor.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/home/meidie/BitMexBot/logs/monitor.log
+StandardError=append:/home/meidie/BitMexBot/logs/monitor.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

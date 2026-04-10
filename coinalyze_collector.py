@@ -234,6 +234,13 @@ def collect_once(conn: sqlite3.Connection, api_key: str):
     _write_heartbeat(oi_rows, liq_rows)
     _log_collection(conn, oi_rows, liq_rows, "OK")
 
+    # Data quality validation (audit item #7)
+    try:
+        from data_validator import validate_latest_bars
+        validate_latest_bars(conn)
+    except Exception as e:
+        _log(f"[WARN] Data validation failed: {e}")
+
 
 def _aggregate_recent(conn: sqlite3.Connection, since_ts: int):
     """Aggregate only timestamps >= since_ts (not the entire table)."""
@@ -379,6 +386,8 @@ def main():
                         help="Backfill available 15m history (~21 days)")
     parser.add_argument("--check", action="store_true",
                         help="Check data integrity and report gaps")
+    parser.add_argument("--cross-validate", action="store_true",
+                        help="Compare Coinalyze OI vs Binance OI (last 7 days)")
     args = parser.parse_args()
 
     try:
@@ -392,6 +401,15 @@ def main():
     except Exception as e:
         _log(f"[FATAL] Cannot init DB: {e}")
         sys.exit(1)
+
+    if args.cross_validate:
+        try:
+            from data_validator import cross_validate_oi
+            cross_validate_oi(days=7)
+        except Exception as e:
+            _log(f"Cross-validation failed: {e}")
+        conn.close()
+        return
 
     if args.check:
         check_integrity(conn)

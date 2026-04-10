@@ -16,10 +16,15 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time as _time
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string
+from flask_httpauth import HTTPBasicAuth
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -38,6 +43,17 @@ LOG_TAIL   = 120
 DASH_PORT  = 5000
 
 app = Flask(__name__)
+auth = HTTPBasicAuth()
+
+DASH_USER = os.environ.get("DASH_USER")
+DASH_PASS = os.environ.get("DASH_PASS")
+
+
+@auth.verify_password
+def verify_password(username, password):
+    if username == DASH_USER and password == DASH_PASS:
+        return username
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -71,11 +87,6 @@ def _parse_latest_diagnostics() -> dict:
     """Parse the last loop's diagnostics from the log file."""
     diag = {
         "candle": {},
-        "indicators": {},
-        "s1_short": [], "s1_long": [],
-        "s2_short": [], "s2_long": [],
-        "s3": [],
-        "s4": [],
         "signal": "NO_TRADE",
         "signal_reason": "",
         "balance": 0,
@@ -116,89 +127,6 @@ def _parse_latest_diagnostics() -> dict:
     if m:
         diag["candle"] = {"o": float(m.group(1)), "h": float(m.group(2)),
                           "l": float(m.group(3)), "c": float(m.group(4))}
-
-    # Indicators
-    m = re.search(r"EMA20=([\d.]+)\s+EMA50=([\d.]+)\s+RSI=([\d.]+)", block_text)
-    if m:
-        diag["indicators"]["ema20"] = float(m.group(1))
-        diag["indicators"]["ema50"] = float(m.group(2))
-        diag["indicators"]["rsi"] = float(m.group(3))
-
-    m = re.search(r"BB upper=([\d.]+)\s+mid=([\d.]+)\s+lower=([\d.]+)", block_text)
-    if m:
-        diag["indicators"]["bb_upper"] = float(m.group(1))
-        diag["indicators"]["bb_mid"] = float(m.group(2))
-        diag["indicators"]["bb_lower"] = float(m.group(3))
-
-    m = re.search(r"ADX=([\d.]+)", block_text)
-    if m:
-        diag["indicators"]["adx"] = float(m.group(1))
-
-    # Trend ages
-    m = re.search(r"SHORT trend age:\s*(\d+)\s+\|\s+LONG trend age:\s*(\d+)", block_text)
-    if m:
-        diag["indicators"]["short_trend_age"] = int(m.group(1))
-        diag["indicators"]["long_trend_age"] = int(m.group(2))
-
-    # Wicks
-    m = re.search(r"Upper wick=([\d.]+)\s+Lower wick=([\d.]+)\s+\(min=([\d.]+)", block_text)
-    if m:
-        diag["indicators"]["upper_wick"] = float(m.group(1))
-        diag["indicators"]["lower_wick"] = float(m.group(2))
-        diag["indicators"]["wick_min"] = float(m.group(3))
-
-    # Parse PASS/FAIL conditions
-    def parse_conditions(pattern_start, count=4):
-        conds = []
-        in_section = False
-        for line in block:
-            if pattern_start in line:
-                in_section = True
-                continue
-            if in_section and ("[PASS]" in line or "[FAIL]" in line):
-                passed = "[PASS]" in line
-                label = line.strip().replace("[PASS] ", "").replace("[FAIL] ", "")
-                conds.append({"pass": passed, "label": label})
-                if len(conds) >= count:
-                    break
-            elif in_section and line.strip() == "":
-                break
-        return conds
-
-    diag["s1_short"] = parse_conditions("SHORT conditions:", 4)
-    diag["s1_long"] = parse_conditions("LONG conditions:", 4)
-    diag["s2_short"] = parse_conditions("BB SHORT conditions:", 4)
-    diag["s2_long"] = parse_conditions("BB LONG conditions:", 4)
-
-    # S3 conditions
-    s3_conds = []
-    in_s3 = False
-    for line in block:
-        if "[S3] EMA crossover" in line:
-            in_s3 = True
-            continue
-        if in_s3 and ("[PASS]" in line or "[FAIL]" in line):
-            passed = "[PASS]" in line
-            label = line.strip().replace("[PASS] ", "").replace("[FAIL] ", "")
-            s3_conds.append({"pass": passed, "label": label})
-        elif in_s3 and ("[S4]" in line or "[NO_TRADE]" in line):
-            break
-    diag["s3"] = s3_conds
-
-    # S4 conditions
-    s4_conds = []
-    in_s4 = False
-    for line in block:
-        if "[S4] RSI reversal" in line:
-            in_s4 = True
-            continue
-        if in_s4 and ("[PASS]" in line or "[FAIL]" in line):
-            passed = "[PASS]" in line
-            label = line.strip().replace("[PASS] ", "").replace("[FAIL] ", "")
-            s4_conds.append({"pass": passed, "label": label})
-        elif in_s4 and "[NO_TRADE]" in line:
-            break
-    diag["s4"] = s4_conds
 
     # Signal result
     m = re.search(r"Signal\s+:\s+(\w+)", block_text)
@@ -327,16 +255,6 @@ _HTML = r"""<!DOCTYPE html>
   .gauge-val { font-size: 13px; font-weight: bold; width: 60px; text-align: right; }
   .gauge-marker { position: absolute; top: 0; height: 100%; width: 2px; background: #fff; z-index: 2; }
 
-  /* Strategy conditions */
-  .strat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
-  .strat-card { background: #111; border-radius: 6px; padding: 10px; border: 1px solid #222; }
-  .strat-header { font-size: 12px; font-weight: bold; color: #aaa; margin-bottom: 8px; display: flex; justify-content: space-between; }
-  .strat-score { font-size: 11px; padding: 2px 6px; border-radius: 4px; }
-  .strat-cond { font-size: 11px; padding: 3px 0; display: flex; align-items: center; gap: 6px; }
-  .cond-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  .cond-pass { background: #66bb6a; box-shadow: 0 0 4px #66bb6a; }
-  .cond-fail { background: #444; }
-  .cond-text { color: #999; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* Price display */
   .price-big { font-size: 32px; font-weight: bold; color: #fff; }
@@ -368,7 +286,6 @@ _HTML = r"""<!DOCTYPE html>
   .log-warn  { color: #ffb74d; } .log-ok { color: #4fc3f7; } .log-ml { color: #ce93d8; }
   .log-loop  { color: #fff; font-weight: bold; }
   .log-pass  { color: #66bb6a; } .log-fail  { color: #ef5350; }
-  .log-s2    { color: #42a5f5; } .log-s3 { color: #ab47bc; } .log-s4 { color: #ff7043; }
 
   /* Equity chart */
   .equity-chart { width: 100%; height: 120px; position: relative; }
@@ -377,7 +294,7 @@ _HTML = r"""<!DOCTYPE html>
   .footer { text-align: center; color: #444; font-size: 12px; padding: 16px; }
 
   @media (max-width: 900px) {
-    .grid-5, .grid-4, .strat-grid { grid-template-columns: repeat(2, 1fr); }
+    .grid-5, .grid-4 { grid-template-columns: repeat(2, 1fr); }
     .grid-2, .grid-2-1 { grid-template-columns: 1fr; }
   }
 </style>
@@ -421,137 +338,13 @@ _HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Row 2: Indicator gauges + Daily loss -->
+  <!-- Row 2: Daily loss gauge -->
   <div class="grid-4">
-    <div class="card">
-      <div class="card-title">RSI (14)</div>
-      <div class="gauge-row">
-        <div class="gauge-track" style="position:relative">
-          <div class="gauge-fill" id="rsi-fill" style="width:50%;background:#666"></div>
-          <div style="position:absolute;top:0;left:30%;height:100%;width:1px;background:#ef535066"></div>
-          <div style="position:absolute;top:0;left:70%;height:100%;width:1px;background:#66bb6a66"></div>
-        </div>
-        <div class="gauge-val" id="rsi-val">--</div>
-      </div>
-      <div class="card-sub">Oversold &lt;30 | Overbought &gt;70</div>
-    </div>
-    <div class="card">
-      <div class="card-title">ADX (14)</div>
-      <div class="gauge-row">
-        <div class="gauge-track">
-          <div class="gauge-fill" id="adx-fill" style="width:0%;background:#666"></div>
-        </div>
-        <div class="gauge-val" id="adx-val">--</div>
-      </div>
-      <div class="card-sub">Trending &gt;25 | Strong &gt;40</div>
-    </div>
-    <div class="card">
-      <div class="card-title">EMA Trend</div>
-      <div class="card-value-sm" id="ema-trend">--</div>
-      <div class="card-sub" id="ema-detail">--</div>
-    </div>
     <div class="card">
       <div class="card-title">Daily Loss Limit</div>
       <div class="card-value-sm" id="daily-loss">--</div>
       <div class="card-sub" id="daily-sub">--</div>
       <div class="bar-wrap"><div class="bar-fill bar-ok" id="loss-bar" style="width:0%"></div></div>
-    </div>
-  </div>
-
-  <!-- Row 3: Strategy condition status -->
-  <div class="card" style="margin-bottom:20px;">
-    <h3>Strategy Conditions (Latest Candle)</h3>
-    <div class="strat-grid">
-      <div class="strat-card">
-        <div class="strat-header">
-          <span>S1: EMA Rejection</span>
-          <span class="strat-score" id="s1-short-score" style="background:#222;color:#888">0/4</span>
-        </div>
-        <div style="font-size:10px;color:#ef5350;margin-bottom:4px">SHORT</div>
-        <div id="s1-short-conds"></div>
-        <div style="font-size:10px;color:#66bb6a;margin-top:6px;margin-bottom:4px">LONG</div>
-        <div id="s1-long-conds"></div>
-      </div>
-      <div class="strat-card">
-        <div class="strat-header">
-          <span>S2: BB Bounce</span>
-          <span class="strat-score" id="s2-short-score" style="background:#222;color:#888">0/4</span>
-        </div>
-        <div style="font-size:10px;color:#ef5350;margin-bottom:4px">SHORT</div>
-        <div id="s2-short-conds"></div>
-        <div style="font-size:10px;color:#66bb6a;margin-top:6px;margin-bottom:4px">LONG</div>
-        <div id="s2-long-conds"></div>
-      </div>
-      <div class="strat-card">
-        <div class="strat-header">
-          <span>S3: EMA Cross</span>
-          <span class="strat-score" id="s3-score" style="background:#222;color:#888">0/?</span>
-        </div>
-        <div id="s3-conds"></div>
-      </div>
-      <div class="strat-card">
-        <div class="strat-header">
-          <span>S4: RSI Reversal</span>
-          <span class="strat-score" id="s4-score" style="background:#222;color:#888">0/?</span>
-        </div>
-        <div id="s4-conds"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Row 4: Price context (BB position + wick info) -->
-  <div class="grid-3">
-    <div class="card">
-      <div class="card-title">Bollinger Band Position</div>
-      <div id="bb-visual" style="margin-top:8px">
-        <div class="gauge-row">
-          <div class="gauge-label">Upper</div>
-          <div class="gauge-val" id="bb-upper-val" style="width:auto;color:#ef5350">--</div>
-        </div>
-        <div class="gauge-row">
-          <div class="gauge-track" style="height:24px;position:relative;background:#111;border:1px solid #222">
-            <div id="bb-price-marker" style="position:absolute;width:12px;height:12px;border-radius:50%;background:#4fc3f7;top:6px;left:50%;transform:translateX(-50%);box-shadow:0 0 6px #4fc3f7;z-index:2"></div>
-            <div id="bb-mid-marker" style="position:absolute;top:0;height:100%;width:1px;background:#ffffff44;left:50%"></div>
-          </div>
-        </div>
-        <div class="gauge-row">
-          <div class="gauge-label">Lower</div>
-          <div class="gauge-val" id="bb-lower-val" style="width:auto;color:#66bb6a">--</div>
-        </div>
-      </div>
-      <div class="card-sub" id="bb-pct-label">--</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Wick Analysis</div>
-      <div style="margin-top:8px">
-        <div class="gauge-row">
-          <div class="gauge-label">Upper</div>
-          <div class="gauge-track"><div class="gauge-fill" id="uwick-fill" style="width:0%;background:#ef5350"></div></div>
-          <div class="gauge-val" id="uwick-val">--</div>
-        </div>
-        <div class="gauge-row">
-          <div class="gauge-label">Lower</div>
-          <div class="gauge-track"><div class="gauge-fill" id="lwick-fill" style="width:0%;background:#66bb6a"></div></div>
-          <div class="gauge-val" id="lwick-val">--</div>
-        </div>
-      </div>
-      <div class="card-sub" id="wick-min-label">Min required: --</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Trend Age</div>
-      <div style="margin-top:8px">
-        <div class="gauge-row">
-          <div class="gauge-label" style="color:#ef5350">Short</div>
-          <div class="gauge-track"><div class="gauge-fill" id="sage-fill" style="width:0%;background:#ef5350"></div></div>
-          <div class="gauge-val" id="sage-val">--</div>
-        </div>
-        <div class="gauge-row">
-          <div class="gauge-label" style="color:#66bb6a">Long</div>
-          <div class="gauge-track"><div class="gauge-fill" id="lage-fill" style="width:0%;background:#66bb6a"></div></div>
-          <div class="gauge-val" id="lage-val">--</div>
-        </div>
-      </div>
-      <div class="card-sub">Min required: 15 candles</div>
     </div>
   </div>
 
@@ -599,9 +392,6 @@ function fmt(v) { if (v===null||v===undefined) return '--'; return (v>=0?'+':'')
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 function colorLog(line) {
-  if (line.includes('[S2]'))         return `<span class="log-s2">${esc(line)}</span>`;
-  if (line.includes('[S3]'))         return `<span class="log-s3">${esc(line)}</span>`;
-  if (line.includes('[S4]'))         return `<span class="log-s4">${esc(line)}</span>`;
   if (line.includes('[SHORT]'))      return `<span class="log-short">${esc(line)}</span>`;
   if (line.includes('[LONG]'))       return `<span class="log-long">${esc(line)}</span>`;
   if (line.includes('[PASS]'))       return `<span class="log-pass">${esc(line)}</span>`;
@@ -612,16 +402,6 @@ function colorLog(line) {
   if (line.includes('[OK]')||line.includes('[LOG]'))     return `<span class="log-ok">${esc(line)}</span>`;
   if (line.includes('Loop #'))       return `<span class="log-loop">${esc(line)}</span>`;
   return `<span>${esc(line)}</span>`;
-}
-
-function renderConds(el, conds) {
-  if (!conds || !conds.length) { el.innerHTML = '<div style="color:#444;font-size:10px">No data</div>'; return 0; }
-  let pass = 0;
-  el.innerHTML = conds.map(c => {
-    if (c.pass) pass++;
-    return `<div class="strat-cond"><div class="cond-dot ${c.pass?'cond-pass':'cond-fail'}"></div><span class="cond-text">${esc(c.label)}</span></div>`;
-  }).join('');
-  return pass;
 }
 
 function renderEquity(data) {
@@ -657,7 +437,6 @@ async function refresh() {
   catch(e) { document.getElementById('status-badge').textContent='Fetch error'; return; }
 
   const diag = d.diagnostics || {};
-  const ind = diag.indicators || {};
 
   // Header
   document.getElementById('ts').textContent = d.now;
@@ -680,94 +459,12 @@ async function refresh() {
   document.getElementById('balance').textContent = diag.balance ? '$' + diag.balance.toFixed(2) : '--';
   document.getElementById('loop-info').textContent = diag.loop ? `Loop #${diag.loop} | ${diag.loop_time}` : '--';
 
-  // RSI gauge
-  const rsi = ind.rsi || 50;
-  document.getElementById('rsi-val').textContent = rsi.toFixed(1);
-  document.getElementById('rsi-fill').style.width = rsi + '%';
-  const rsiColor = rsi < 30 ? '#66bb6a' : rsi > 70 ? '#ef5350' : rsi < 40 ? '#81c784' : rsi > 60 ? '#e57373' : '#666';
-  document.getElementById('rsi-fill').style.background = rsiColor;
-
-  // ADX gauge
-  const adx = ind.adx || 0;
-  document.getElementById('adx-val').textContent = adx.toFixed(1);
-  document.getElementById('adx-fill').style.width = Math.min(adx, 60) / 60 * 100 + '%';
-  document.getElementById('adx-fill').style.background = adx >= 40 ? '#66bb6a' : adx >= 25 ? '#ffb74d' : '#666';
-
-  // EMA trend
-  const ema20 = ind.ema20 || 0, ema50 = ind.ema50 || 0;
-  const trendEl = document.getElementById('ema-trend');
-  if (ema20 > ema50) { trendEl.innerHTML = '<span class="pos">UPTREND</span>'; }
-  else if (ema20 < ema50) { trendEl.innerHTML = '<span class="neg">DOWNTREND</span>'; }
-  else { trendEl.innerHTML = '<span class="neu">NEUTRAL</span>'; }
-  document.getElementById('ema-detail').textContent = ema20 ? `EMA20: ${ema20.toFixed(0)} | EMA50: ${ema50.toFixed(0)} | Gap: ${(ema20-ema50).toFixed(0)}` : '--';
-
   // Daily loss
   document.getElementById('daily-loss').textContent = '$' + d.daily_loss_usd.toFixed(2);
   document.getElementById('daily-sub').textContent = d.daily_loss_pct + '% of $' + MAX_LOSS.toFixed(2);
   const bar = document.getElementById('loss-bar');
   bar.style.width = d.daily_loss_pct + '%';
   bar.className = 'bar-fill ' + (d.daily_loss_pct>=100?'bar-crit':d.daily_loss_pct>=70?'bar-warn':'bar-ok');
-
-  // BB position
-  const bbU = ind.bb_upper || 0, bbM = ind.bb_mid || 0, bbL = ind.bb_lower || 0;
-  document.getElementById('bb-upper-val').textContent = bbU ? bbU.toFixed(0) : '--';
-  document.getElementById('bb-lower-val').textContent = bbL ? bbL.toFixed(0) : '--';
-  if (price && bbU && bbL && bbU > bbL) {
-    const pct = ((price - bbL) / (bbU - bbL)) * 100;
-    document.getElementById('bb-price-marker').style.left = Math.max(2, Math.min(98, pct)) + '%';
-    document.getElementById('bb-mid-marker').style.left = '50%';
-    document.getElementById('bb-pct-label').textContent = `Price at ${pct.toFixed(0)}% of band width | Mid: ${bbM.toFixed(0)}`;
-  }
-
-  // Wick analysis
-  const uw = ind.upper_wick || 0, lw = ind.lower_wick || 0, wm = ind.wick_min || 1;
-  document.getElementById('uwick-val').textContent = uw.toFixed(1);
-  document.getElementById('lwick-val').textContent = lw.toFixed(1);
-  document.getElementById('uwick-fill').style.width = Math.min(uw / (wm * 3) * 100, 100) + '%';
-  document.getElementById('lwick-fill').style.width = Math.min(lw / (wm * 3) * 100, 100) + '%';
-  document.getElementById('uwick-fill').style.background = uw >= wm ? '#ef5350' : '#444';
-  document.getElementById('lwick-fill').style.background = lw >= wm ? '#66bb6a' : '#444';
-  document.getElementById('wick-min-label').textContent = `Min required: ${wm.toFixed(1)} pts (0.05% of close)`;
-
-  // Trend age
-  const sa = ind.short_trend_age || 0, la = ind.long_trend_age || 0;
-  document.getElementById('sage-val').textContent = sa;
-  document.getElementById('lage-val').textContent = la;
-  document.getElementById('sage-fill').style.width = Math.min(sa / 30 * 100, 100) + '%';
-  document.getElementById('lage-fill').style.width = Math.min(la / 30 * 100, 100) + '%';
-  document.getElementById('sage-fill').style.background = sa >= 15 ? '#ef5350' : '#444';
-  document.getElementById('lage-fill').style.background = la >= 15 ? '#66bb6a' : '#444';
-
-  // Strategy conditions
-  const s1sp = renderConds(document.getElementById('s1-short-conds'), diag.s1_short);
-  const s1lp = renderConds(document.getElementById('s1-long-conds'), diag.s1_long);
-  const s1best = Math.max(s1sp, s1lp);
-  const s1sc = document.getElementById('s1-short-score');
-  s1sc.textContent = `${s1best}/4`;
-  s1sc.style.background = s1best >= 4 ? '#1b5e20' : s1best >= 3 ? '#33691e44' : '#222';
-  s1sc.style.color = s1best >= 4 ? '#66bb6a' : s1best >= 3 ? '#aed581' : '#888';
-
-  const s2sp = renderConds(document.getElementById('s2-short-conds'), diag.s2_short);
-  const s2lp = renderConds(document.getElementById('s2-long-conds'), diag.s2_long);
-  const s2best = Math.max(s2sp, s2lp);
-  const s2sc = document.getElementById('s2-short-score');
-  s2sc.textContent = `${s2best}/4`;
-  s2sc.style.background = s2best >= 4 ? '#1b5e20' : s2best >= 3 ? '#33691e44' : '#222';
-  s2sc.style.color = s2best >= 4 ? '#66bb6a' : s2best >= 3 ? '#aed581' : '#888';
-
-  const s3p = renderConds(document.getElementById('s3-conds'), diag.s3);
-  const s3t = (diag.s3 || []).length || '?';
-  const s3sc = document.getElementById('s3-score');
-  s3sc.textContent = `${s3p}/${s3t}`;
-  s3sc.style.background = s3p >= s3t && s3t > 0 ? '#1b5e20' : '#222';
-  s3sc.style.color = s3p >= s3t && s3t > 0 ? '#66bb6a' : '#888';
-
-  const s4p = renderConds(document.getElementById('s4-conds'), diag.s4);
-  const s4t = (diag.s4 || []).length || '?';
-  const s4sc = document.getElementById('s4-score');
-  s4sc.textContent = `${s4p}/${s4t}`;
-  s4sc.style.background = s4p >= s4t && s4t > 0 ? '#1b5e20' : '#222';
-  s4sc.style.color = s4p >= s4t && s4t > 0 ? '#66bb6a' : '#888';
 
   // Equity curve
   renderEquity(d.equity_curve);
@@ -808,16 +505,25 @@ refresh();
 
 
 @app.route("/")
+@auth.login_required
 def index():
     return render_template_string(_HTML)
 
 
 @app.route("/api/data")
+@auth.login_required
 def api_data():
     return jsonify(_collect())
 
 
 if __name__ == "__main__":
+    if not DASH_USER or not DASH_PASS:
+        print("[FATAL] DASH_USER and DASH_PASS must be set in .env")
+        print("  Add these lines to your .env file:")
+        print("    DASH_USER=admin")
+        print("    DASH_PASS=your_secure_password_here")
+        sys.exit(1)
+
     bind_host = "0.0.0.0"
     try:
         import subprocess

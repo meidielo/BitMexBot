@@ -32,3 +32,5 @@ tzdata==2025.3
 urllib3==2.6.3
 yarl==1.23.0
 statsmodels==0.14.6
+flask==3.1.1
+flask-httpauth==4.8.1

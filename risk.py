@@ -225,21 +225,23 @@ def _print_result(result: dict) -> None:
 
 
 if __name__ == "__main__":
-    from fetch_data import fetch_ohlcv
-    from indicators import compute_indicators
+    from fetch_data import fetch_ohlcv, fetch_current_funding, fetch_recent_funding
     from signals import get_signal
 
     print("Phase 4 — Risk filter check on live testnet signal\n")
 
-    df_raw = fetch_ohlcv()
-    if df_raw is None:
+    df = fetch_ohlcv()
+    if df is None:
         raise SystemExit("[ABORT] Could not fetch OHLCV data.")
 
-    df = compute_indicators(df_raw)
-    if df is None:
-        raise SystemExit("[ABORT] Indicator computation failed.")
+    funding = fetch_current_funding()
+    recent = fetch_recent_funding(count=10)
+    funding_data = None
+    if funding and funding.get("rate") is not None:
+        cum_24h = recent["rate"].tail(3).sum() if not recent.empty else 0
+        funding_data = {"rate": funding["rate"], "funding_24h": cum_24h}
 
-    sig = get_signal(df)
+    sig = get_signal(df, current_funding=funding_data)
     print(f"Signal received: {sig['signal']}  |  {sig['reason']}\n")
 
     # Use a dummy balance of $1,000 and no open positions for the demo

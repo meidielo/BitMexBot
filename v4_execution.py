@@ -29,7 +29,9 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from bitmex_client import get_client, get_data_client
+from condition_logger import get_logger as get_condition_logger, log_v4_conditions
 from fetch_data import fetch_recent_funding
+from forward_tracker import get_tracker as get_forward_tracker, record_signal, record_execution, record_exit
 from order_manager import execute_signal, round_to_tick, SYMBOL
 from risk import validate_signal
 from logger import log_trade, update_trade_exit
@@ -38,6 +40,20 @@ load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Constants — V4 signal parameters (frozen, matching backtest_v3.py)
+#
+# CALIBRATION NOTE (Audit item #4: Daily vs 15m threshold mismatch):
+#   The backtest (backtest_v3.py) uses these same parameters on DAILY bars:
+#     - LIQ_SPIKE_MULT=3.0 on daily long liquidation totals vs 20-day avg
+#   Live execution uses 15m Coinalyze data aggregated to hourly (4 bars):
+#     - Same 3.0× threshold but against avg HOURLY long liq over 20 days
+#   These are intentionally different resolutions measuring the same thing:
+#     Daily bar: sum of all liq in 24h vs avg daily liq
+#     Hourly bar: sum of last 4×15m bars vs avg hourly liq
+#   The ratio (spike vs baseline) is scale-invariant — a 3× spike relative
+#   to the rolling average means the same thing at any resolution.
+#   However, the ABSOLUTE values differ (daily sums > hourly sums), and
+#   the timing precision differs (daily catches any intraday cascade,
+#   hourly catches cascades within the most recent hour only).
 # ---------------------------------------------------------------------------
 EMA_PERIOD         = 200
 FUNDING_THRESHOLD  = 0.0003     # 0.03% per 8h settlement
@@ -51,7 +67,8 @@ TARGET_RR          = 2.0
 COOLDOWN_HOURS     = 24
 
 # Loop timing
-LOOP_SECONDS       = 15 * 60    # 15 min
+LOOP_SECONDS       = 15 * 60    # 15 min (default for non-critical states)
+MICRO_LOOP_SECONDS = 60         # 1 min (for armed micro-trigger polling)
 LOOP_OFFSET_SEC    = 30         # wake 30s after quarter-hour
 MACRO_UPDATE_HOUR  = 0          # 00:xx UTC
 MACRO_UPDATE_MIN   = 15         # 00:15 UTC
@@ -292,10 +309,26 @@ def _update_macro_context(conn: sqlite3.Connection) -> dict:
     if not funding_valid:
         reason.append(f"funding low: peak={funding_peak*100:.4f}% <= {FUNDING_THRESHOLD*100:.2f}%")
 
-    log.info("Macro %s: close=%s EMA200=%s ATR=%s fund_peak=%s%% %s",
-             status, f"{last_close:,.0f}", f"{ema200:,.0f}", f"{atr:,.0f}",
-             f"{funding_peak*100:.4f}",
+    # Telemetry: distance-to-trigger for macro conditions
+    ema_gap_pct = (last_close - ema200) / ema200 * 100 if ema200 > 0 else 0
+    fund_gap_pct = ((funding_peak - FUNDING_THRESHOLD) / FUNDING_THRESHOLD * 100
+                    if FUNDING_THRESHOLD > 0 else 0)
+
+    log.info("Macro %s: close=%s EMA200=%s (gap=%+.2f%%) ATR=%s "
+             "fund_peak=%s%% (gap=%+.1f%%) %s",
+             status, f"{last_close:,.0f}", f"{ema200:,.0f}", ema_gap_pct,
+             f"{atr:,.0f}", f"{funding_peak*100:.4f}", fund_gap_pct,
              f"({'; '.join(reason)})" if reason else "")
+
+    # Log to condition tracker
+    try:
+        cond_conn = get_condition_logger()
+        log_v4_conditions(cond_conn,
+                         close=last_close, ema200=ema200,
+                         funding_peak=funding_peak,
+                         funding_threshold=FUNDING_THRESHOLD)
+    except Exception as e:
+        log.debug("Condition logging failed: %s", e)
 
     _log_to_db(conn, "INFO", f"Macro update: {status} | "
                f"close={last_close:.0f} EMA200={ema200:.0f} ATR={atr:.0f} "
@@ -311,6 +344,7 @@ def _update_macro_context(conn: sqlite3.Connection) -> dict:
 def _check_micro_trigger(conn: sqlite3.Connection) -> dict | None:
     """
     Query Coinalyze 15m aggregated data for liquidation spike + OI drop.
+    Computes ALL condition values first, logs telemetry, then evaluates.
     Returns trigger metadata dict if conditions met, else None.
     """
     try:
@@ -320,8 +354,14 @@ def _check_micro_trigger(conn: sqlite3.Connection) -> dict | None:
         log.error("Cannot open Coinalyze DB: %s", e)
         return None
 
+    # Telemetry accumulators — always computed, logged regardless of pass/fail
+    ratio = 0.0
+    long_pct = 0.0
+    oi_delta_pct = 0.0
+    data_sufficient = True
+
     try:
-        # Latest 4 bars (1 hour) of liquidations
+        # --- Compute liquidation metrics ---
         rows = cz.execute("""
             SELECT timestamp, liq_long, liq_short
             FROM liquidations_15m_agg
@@ -331,46 +371,34 @@ def _check_micro_trigger(conn: sqlite3.Connection) -> dict | None:
 
         if len(rows) < 4:
             log.debug("Only %d liq rows (need 4)", len(rows))
-            return None
+            data_sufficient = False
+        else:
+            hourly_long = sum(r[1] or 0 for r in rows)
+            hourly_short = sum(r[2] or 0 for r in rows)
+            hourly_total = hourly_long + hourly_short
 
-        hourly_long = sum(r[1] or 0 for r in rows)
-        hourly_short = sum(r[2] or 0 for r in rows)
-        hourly_total = hourly_long + hourly_short
+            if hourly_total > 0:
+                long_pct = hourly_long / hourly_total
 
-        if hourly_total <= 0:
-            return None
+            # 20-day baseline
+            max_ts = rows[0][0]
+            since_ts = max_ts - (LIQ_LOOKBACK_DAYS * 86400)
 
-        long_pct = hourly_long / hourly_total
+            baseline_row = cz.execute("""
+                SELECT SUM(liq_long), COUNT(*)
+                FROM liquidations_15m_agg
+                WHERE timestamp >= ?
+            """, (since_ts,)).fetchone()
 
-        # 20-day baseline: average hourly long liquidations
-        max_ts = rows[0][0]
-        since_ts = max_ts - (LIQ_LOOKBACK_DAYS * 86400)
+            total_long_20d = baseline_row[0] or 0
+            n_bars_20d = baseline_row[1] or 1
+            hours_20d = n_bars_20d / 4
+            avg_hourly_long = total_long_20d / hours_20d if hours_20d > 0 else 1
 
-        baseline_row = cz.execute("""
-            SELECT SUM(liq_long), COUNT(*)
-            FROM liquidations_15m_agg
-            WHERE timestamp >= ?
-        """, (since_ts,)).fetchone()
+            if avg_hourly_long > 0:
+                ratio = hourly_long / avg_hourly_long
 
-        total_long_20d = baseline_row[0] or 0
-        n_bars_20d = baseline_row[1] or 1
-        # Convert to hourly: each bar is 15min, so 4 bars = 1 hour
-        hours_20d = n_bars_20d / 4
-        avg_hourly_long = total_long_20d / hours_20d if hours_20d > 0 else 1
-
-        if avg_hourly_long <= 0:
-            return None
-
-        ratio = hourly_long / avg_hourly_long
-
-        # Check spike threshold
-        if ratio < LIQ_SPIKE_MULT:
-            return None
-
-        if long_pct < LIQ_LONG_DOM:
-            return None
-
-        # OI confirmation: current vs 4 bars ago
+        # --- Compute OI metrics ---
         oi_rows = cz.execute("""
             SELECT timestamp, oi_close
             FROM oi_15m_agg
@@ -378,19 +406,43 @@ def _check_micro_trigger(conn: sqlite3.Connection) -> dict | None:
             LIMIT 5
         """).fetchall()
 
-        if len(oi_rows) < 5:
+        if len(oi_rows) >= 5:
+            oi_now = oi_rows[0][1] or 0
+            oi_prev = oi_rows[4][1] or 0
+            if oi_prev > 0:
+                oi_delta_pct = (oi_now - oi_prev) / oi_prev
+        else:
             log.debug("Only %d OI rows (need 5)", len(oi_rows))
+            data_sufficient = False
+
+        # --- Telemetry: always log condition distances ---
+        log.info("Telemetry: liq_ratio=%.2f/%.1f  L%%=%.0f%%/%.0f%%  "
+                 "OI_Δ=%+.2f%%/0%%  data=%s",
+                 ratio, LIQ_SPIKE_MULT,
+                 long_pct * 100, LIQ_LONG_DOM * 100,
+                 oi_delta_pct * 100,
+                 "OK" if data_sufficient else "INSUFFICIENT")
+
+        # Log to condition tracker
+        try:
+            cond_conn = get_condition_logger()
+            log_v4_conditions(cond_conn,
+                             liq_ratio=ratio, liq_spike_mult=LIQ_SPIKE_MULT,
+                             liq_long_pct=long_pct, liq_long_dom=LIQ_LONG_DOM,
+                             oi_delta_pct=oi_delta_pct)
+        except Exception as e:
+            log.debug("Condition logging failed: %s", e)
+
+        # --- Evaluate pass/fail ---
+        if not data_sufficient:
             return None
 
-        oi_now = oi_rows[0][1] or 0
-        oi_prev = oi_rows[4][1] or 0
-
-        if oi_prev <= 0:
+        if ratio < LIQ_SPIKE_MULT:
             return None
 
-        oi_delta_pct = (oi_now - oi_prev) / oi_prev
+        if long_pct < LIQ_LONG_DOM:
+            return None
 
-        # OI must have dropped
         if oi_delta_pct >= 0:
             return None
 
@@ -533,6 +585,14 @@ def _execute_entry(conn: sqlite3.Connection, macro: dict, trigger: dict) -> bool
     _log_to_db(conn, "TRADE", f"LONG opened: fill={fill_price:.1f} "
                f"SL={sl_price:.1f} TP={tp_price:.1f}")
 
+    # Forward performance tracking
+    try:
+        ft_conn = get_forward_tracker()
+        record_signal(ft_conn, order_id, bid, trigger)
+        record_execution(ft_conn, order_id, fill_price, bid)
+    except Exception as e:
+        log.debug("Forward tracking failed: %s", e)
+
     return True
 
 
@@ -607,6 +667,13 @@ def _check_exit(conn: sqlite3.Connection, state: dict) -> bool:
     if order_id:
         update_trade_exit(order_id, exit_price, exit_reason)
 
+        # Forward performance tracking
+        try:
+            ft_conn = get_forward_tracker()
+            record_exit(ft_conn, order_id, exit_price, exit_reason)
+        except Exception:
+            pass
+
     # Transition to COOLDOWN
     cooldown_until = (datetime.now(timezone.utc) +
                       timedelta(hours=COOLDOWN_HOURS)).isoformat()
@@ -626,21 +693,23 @@ def _check_exit(conn: sqlite3.Connection, state: dict) -> bool:
 # Sleep alignment
 # ---------------------------------------------------------------------------
 
-def _sleep_to_next_15m(loop_start: float):
-    """Sleep until 30 seconds after the next quarter-hour."""
+def _sleep_to_next(interval_seconds: int, loop_start: float):
+    """Sleep until the next interval boundary (+ offset for 15m intervals)."""
     now = time.time()
     elapsed = now - loop_start
 
-    # Next quarter-hour boundary + offset
-    current_quarter = int(now // LOOP_SECONDS) * LOOP_SECONDS
-    next_wake = current_quarter + LOOP_SECONDS + LOOP_OFFSET_SEC
+    if interval_seconds >= LOOP_SECONDS:
+        # 15m+ intervals: align to quarter-hour boundary
+        current_boundary = int(now // LOOP_SECONDS) * LOOP_SECONDS
+        next_wake = current_boundary + LOOP_SECONDS + LOOP_OFFSET_SEC
+        sleep_sec = max(1, next_wake - now)
+        sleep_sec = min(sleep_sec, LOOP_SECONDS + LOOP_OFFSET_SEC)
+    else:
+        # Sub-minute intervals (1m micro polling): simple fixed interval
+        sleep_sec = max(1, interval_seconds - elapsed)
 
-    sleep_sec = max(1, next_wake - now)
-
-    # Cap at 16 minutes (safety)
-    sleep_sec = min(sleep_sec, LOOP_SECONDS + LOOP_OFFSET_SEC)
-
-    log.info("Sleeping %.0fs (loop took %.1fs)", sleep_sec, elapsed)
+    log.info("Sleeping %.0fs (loop took %.1fs, interval=%ds)",
+             sleep_sec, elapsed, interval_seconds)
     time.sleep(sleep_sec)
 
 
@@ -794,8 +863,13 @@ def main():
         state = _load_state(conn)
         _write_heartbeat(state["state"], loop_count)
 
-        # Sleep to next 15m window
-        _sleep_to_next_15m(loop_start)
+        # Adaptive sleep interval:
+        #   IDLE + macro_valid → 1-min polling (micro trigger needs speed)
+        #   Everything else    → 15-min polling (nothing urgent to check)
+        if state["state"] == State.IDLE and state.get("macro_valid"):
+            _sleep_to_next(MICRO_LOOP_SECONDS, loop_start)
+        else:
+            _sleep_to_next(LOOP_SECONDS, loop_start)
 
     conn.close()
     log.info("V4 service stopped.")

@@ -428,24 +428,26 @@ def execute_signal(signal: dict, validated_risk: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from fetch_data import fetch_ohlcv
-    from indicators import compute_indicators
+    from fetch_data import fetch_ohlcv, fetch_current_funding, fetch_recent_funding
     from signals import get_signal
     from risk import validate_signal
 
     print("Phase 5 — Order execution on BitMEX testnet")
     print("WARNING: This will place REAL orders on testnet. Ctrl-C to abort.\n")
 
-    # Fetch → indicators → signal → risk → execute
-    df_raw = fetch_ohlcv()
-    if df_raw is None:
+    # Fetch → signal (V2 funding rate) → risk → execute
+    df = fetch_ohlcv()
+    if df is None:
         raise SystemExit("[ABORT] Could not fetch OHLCV data.")
 
-    df = compute_indicators(df_raw)
-    if df is None:
-        raise SystemExit("[ABORT] Indicator computation failed.")
+    funding = fetch_current_funding()
+    recent = fetch_recent_funding(count=10)
+    funding_data = None
+    if funding and funding.get("rate") is not None:
+        cum_24h = recent["rate"].tail(3).sum() if not recent.empty else 0
+        funding_data = {"rate": funding["rate"], "funding_24h": cum_24h}
 
-    sig = get_signal(df)
+    sig = get_signal(df, current_funding=funding_data)
     print(f"Signal  : {sig['signal']}")
     print(f"Reason  : {sig['reason']}\n")
 
