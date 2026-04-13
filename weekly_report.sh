@@ -6,6 +6,8 @@ cd /home/meidie/BitMexBot
 source venv/bin/activate
 
 DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+STATE_FILE="data/weekly_report_state.json"
+
 echo ""
 echo "================================================================"
 echo "  BitMexBot Weekly Update — $DATE"
@@ -36,9 +38,10 @@ except: print('  Funding: unavailable')
 # Services
 echo ""
 echo "## Services"
-echo "  bitmexbot:  $(systemctl is-active bitmexbot.service 2>/dev/null || echo 'unknown')"
-echo "  bitmexdash: $(systemctl is-active bitmexdash.service 2>/dev/null || echo 'unknown')"
-echo "  bitmexv4:   $(systemctl is-active bitmexv4.service 2>/dev/null || echo 'unknown')"
+for svc in bitmexbot bitmexdash bitmexv4; do
+    STATUS=$(systemctl is-active ${svc}.service 2>/dev/null) || true
+    echo "  ${svc}: ${STATUS:-unknown}"
+done
 
 # Data pipeline
 echo ""
@@ -55,18 +58,51 @@ else
     echo "  Coinalyze collector: NO HEARTBEAT FILE"
 fi
 
-if [ -f data/condition_log.db ]; then
-    COND_ROWS=$(sqlite3 data/condition_log.db "SELECT COUNT(*) FROM condition_log" 2>/dev/null)
-    echo "  Condition log: ${COND_ROWS} rows"
-else
-    echo "  Condition log: not yet created"
-fi
+# Use Python for all SQLite queries (sqlite3 CLI not reliably in PATH)
+python3 -c "
+import sqlite3, os, json
 
-if [ -f data/coinalyze.db ]; then
-    OI_ROWS=$(sqlite3 data/coinalyze.db "SELECT COUNT(*) FROM oi_15m_agg" 2>/dev/null)
-    LIQ_ROWS=$(sqlite3 data/coinalyze.db "SELECT COUNT(*) FROM liquidations_15m_agg" 2>/dev/null)
-    echo "  Coinalyze 15m: ${OI_ROWS} OI bars, ${LIQ_ROWS} liq bars"
-fi
+state_file = '$STATE_FILE'
+prev = {}
+if os.path.exists(state_file):
+    try:
+        with open(state_file) as f:
+            prev = json.load(f)
+    except: pass
+
+current = {}
+
+# Condition log
+if os.path.exists('data/condition_log.db'):
+    conn = sqlite3.connect('data/condition_log.db', timeout=5)
+    rows = conn.execute('SELECT COUNT(*) FROM condition_log').fetchone()[0]
+    conn.close()
+    prev_rows = prev.get('condition_log', 0)
+    delta = rows - prev_rows
+    delta_str = f' (+{delta})' if prev_rows > 0 and delta >= 0 else ''
+    print(f'  Condition log: {rows:,} rows{delta_str}')
+    current['condition_log'] = rows
+else:
+    print('  Condition log: not yet created')
+
+# Coinalyze 15m
+if os.path.exists('data/coinalyze.db'):
+    conn = sqlite3.connect('data/coinalyze.db', timeout=5)
+    oi = conn.execute('SELECT COUNT(*) FROM oi_15m_agg').fetchone()[0]
+    liq = conn.execute('SELECT COUNT(*) FROM liquidations_15m_agg').fetchone()[0]
+    conn.close()
+    prev_oi = prev.get('oi_15m', 0)
+    prev_liq = prev.get('liq_15m', 0)
+    oi_d = f' (+{oi - prev_oi})' if prev_oi > 0 else ''
+    liq_d = f' (+{liq - prev_liq})' if prev_liq > 0 else ''
+    print(f'  Coinalyze 15m: {oi:,} OI bars{oi_d}, {liq:,} liq bars{liq_d}')
+    current['oi_15m'] = oi
+    current['liq_15m'] = liq
+
+# Save state for next week's delta
+with open(state_file, 'w') as f:
+    json.dump(current, f)
+" 2>/dev/null
 
 # Codebase health
 echo ""
