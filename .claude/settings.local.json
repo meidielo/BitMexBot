@@ -5,7 +5,6 @@
       "Bash(pip install:*)",
       "Bash(python fetch_data.py)",
       "Bash(python -c \":*)",
-      "Bash(python indicators.py)",
       "Bash(python signals.py)",
       "Bash(python -m pytest test_risk.py -v)",
       "Bash(python risk.py)",
