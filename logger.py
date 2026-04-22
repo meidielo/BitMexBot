@@ -155,6 +155,28 @@ def log_trade(trade_dict: dict) -> int | None:
         return None
 
 
+def compute_pnl_usdt(signal: str, entry_price: float, exit_price: float,
+                     contracts: float) -> float:
+    """
+    Realised PnL in USDT for an XBTUSDT linear perpetual position.
+
+    For linear perpetuals settled in USDT where 1 contract = 1 USDT notional,
+    a position of N contracts represents N / entry_price BTC of exposure.
+    Closing at exit_price realises:
+
+        LONG  : contracts * (exit - entry) / entry
+        SHORT : contracts * (entry - exit) / entry
+
+    Note: `position_size_btc` is the historical column name in trades.db,
+    but the stored value is contract count, not BTC (see risk.py:67 —
+    `size is in contracts`, MAX_CONTRACTS = 1500). Column rename is a
+    schema change deferred to a separate commit.
+    """
+    if signal == "LONG":
+        return contracts * (exit_price - entry_price) / entry_price
+    return contracts * (entry_price - exit_price) / entry_price
+
+
 def update_trade_exit(order_id: str, exit_price: float,
                       exit_reason: str) -> bool:
     """
@@ -166,10 +188,8 @@ def update_trade_exit(order_id: str, exit_price: float,
     exit_price  : price at which the position was closed
     exit_reason : 'TP' | 'SL' | 'MANUAL'
 
-    PnL formula (linear approximation — accurate within ~0.5 % for small moves)
-    ----------
-    LONG  : pnl_usd = (exit_price - entry_price) * position_size_btc
-    SHORT : pnl_usd = (entry_price - exit_price) * position_size_btc
+    PnL is computed by compute_pnl_usdt() — see that function's docstring
+    for the linear-perpetual formula.
 
     Returns True on success, False on failure.
     """
@@ -192,11 +212,8 @@ def update_trade_exit(order_id: str, exit_price: float,
             opened_at         = datetime.fromisoformat(row["timestamp"].replace(" ", "T"))
             opened_at         = opened_at.replace(tzinfo=timezone.utc)
 
-            # PnL
-            if signal == "LONG":
-                pnl_usd = (exit_price - entry_price) * position_size_btc
-            else:  # SHORT
-                pnl_usd = (entry_price - exit_price) * position_size_btc
+            pnl_usd = compute_pnl_usdt(signal, entry_price, exit_price,
+                                       position_size_btc)
 
             duration_seconds = int(
                 (datetime.now(timezone.utc) - opened_at).total_seconds()

@@ -37,22 +37,21 @@ Engineering for autonomous trading infrastructure on a real exchange API — not
 
 ### Trade history
 
-20 autonomous entries placed late March – early April 2026, all risk-approved. 8 closed (5 wins / 3 losses); the remainder were order-placement failures the system logged and recovered from without crashing. Strategy is correctly silent right now — funding rate has been 5–10× below the entry threshold for 14+ days.
+20 autonomous entries placed late March – early April 2026, all risk-approved. 8 closed (5 wins / 3 losses, **+1.41 USDT net** on a ~$700 testnet balance — directional edge was positive over the sample but N is far too small for an inference); the remaining 12 were order-placement failures the system logged and recovered from without crashing. Strategy is correctly silent right now — funding rate has been 5–10× below the entry threshold for 14+ days.
 
-| # | Entry time (UTC) | Side  | Entry  | Exit   | PnL (testnet quote units) | Closed by |
-|---|------------------|-------|--------|--------|---------------------------|-----------|
-| 1 | 2026-04-05 22:33 | LONG  | 67,386 | 67,640 | +47,808.4                 | MANUAL    |
-| 2 | 2026-04-06 16:03 | SHORT | 69,867 | 69,890 | −4,419.7                  | MANUAL    |
-| 3 | 2026-04-07 15:03 | LONG  | 67,828 | 67,915 | +16,243.2                 | MANUAL    |
-| 4 | 2026-04-07 21:18 | SHORT | 69,777 | 69,835 | −11,136.1                 | MANUAL    |
-| 5 | 2026-04-08 13:48 | LONG  | 71,867 | 71,942 | +14,869.8                 | MANUAL    |
-| 6 | 2026-04-08 17:33 | LONG  | 71,571 | 71,727 | +30,771.4                 | MANUAL    |
-| 7 | 2026-04-09 02:03 | SHORT | 70,878 | 70,893 | −2,979.2                  | MANUAL    |
-| 8 | 2026-04-10 08:03 | LONG  | 71,463 | 71,496 | +6,311.2                  | MANUAL    |
+| # | Entry time (UTC) | Side  | Entry  | Exit   | Size (contracts) | PnL (USDT) | Closed by |
+|---|------------------|-------|--------|--------|------------------|------------|-----------|
+| 1 | 2026-04-05 22:33 | LONG  | 67,386 | 67,640 | 188              | +0.7095    | MANUAL    |
+| 2 | 2026-04-06 16:03 | SHORT | 69,867 | 69,890 | 193              | −0.0633    | MANUAL    |
+| 3 | 2026-04-07 15:03 | LONG  | 67,828 | 67,915 | 188              | +0.2395    | MANUAL    |
+| 4 | 2026-04-07 21:18 | SHORT | 69,777 | 69,835 | 193              | −0.1596    | MANUAL    |
+| 5 | 2026-04-08 13:48 | LONG  | 71,867 | 71,942 | 198              | +0.2069    | MANUAL    |
+| 6 | 2026-04-08 17:33 | LONG  | 71,571 | 71,727 | 197              | +0.4299    | MANUAL    |
+| 7 | 2026-04-09 02:03 | SHORT | 70,878 | 70,893 | 196              | −0.0420    | MANUAL    |
+| 8 | 2026-04-10 08:03 | LONG  | 71,463 | 71,496 | 196              | +0.0883    | MANUAL    |
+|   |                  |       |        |        | **Total**        | **+1.4092**|           |
 
-**PnL units caveat (TODO).** The values above are computed in `logger.py` as `(exit_price − entry_price) × position_size_btc`. That formula is correct for coin-margined contracts but the bot trades XBTUSDT linear perpetual, where 1 contract = $1 USDT notional. Treating the linear-contract count as a BTC quantity overstates realized PnL by roughly the entry price. The actual realized USDT PnL on the testnet account is ~1/entry_price of the values shown — small. Filed as a future fix to `logger.py`. The pattern of wins/losses (5/3) and the timestamps are accurate; the dollar magnitudes are not.
-
-"Closed by: MANUAL" means manually closed (the autonomous SL/TP didn't fire); the *entries* are all autonomous and risk-approved.
+PnL is computed in `logger.compute_pnl_usdt` as `contracts × (exit − entry) / entry` for longs (sign inverted for shorts) — the correct formula for XBTUSDT linear perpetual where 1 contract = 1 USDT notional. "Closed by: MANUAL" means manually closed (the autonomous SL/TP didn't fire); the *entries* are all autonomous and risk-approved.
 
 ## Quick Start
 
