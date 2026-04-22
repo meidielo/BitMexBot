@@ -4,16 +4,15 @@
 Learn trading bot engineering. Build in phases. Testnet only until confidence is high.
 
 ## Current Phase
-**Post-audit, post-V2. One live strategy (V2 Funding Rate Mean-Reversion) structurally silent in 2025-2026 regime. V4 cascade service running on separate systemd, data-blocked at N=4. 8 strategy families killed in the graveyard (see `tasks/lessons.md` L26-L30).**
+**Post-audit. One live strategy (V2 Funding Rate Mean-Reversion) structurally silent in 2025-2026 regime; bot still runs the loop but the funding gate hasn't fired since 2026-04-10. V4 Cascade Dip-Buy was the next strategy attempt — killed and deleted from the codebase 2026-04-22 after data-block at N=4 validation. Nine strategy families now killed in the graveyard.**
 
 ## Current Strategies
 
 | Name | Type | Status |
 |------|------|--------|
 | V2 Funding Rate Mean-Reversion | `signals.py` | Live on main.py loop, fires ~0x/6mo in current regime (L30 — not broken, regime dead) |
-| V4 Cascade Dip-Buy | `v4_execution.py` | Separate systemd service, N=4 backtest, data-blocked on statistical validation |
 
-Dead strategies (graveyard, see `tasks/lessons.md`): V1-V3 indicators, S1-S4 multi-strategy engine, pairs/stat-arb, cross-sectional momentum, funding settlement arb, vol regime (H1/H2/H2b/H3).
+Dead strategies (graveyard, see `tasks/lessons.md`): V1–V4 indicators/cascade variants, S1-S4 multi-strategy engine, pairs/stat-arb, cross-sectional momentum, funding settlement arb, vol regime (H1/H2/H2b/H3).
 
 ## Risk Rules (hardcoded, confirmed working)
 - Leverage: 15x fixed (verified after set_leverage)
@@ -59,38 +58,28 @@ logger.py                 # SQLite trade logging (TOCTOU-safe)
 monitor.py                # daily summary
 main.py                   # V2 orchestrator — 15m loop
 
-# V4 cascade dip-buy (separate service)
-v4_execution.py           # V4 standalone service (systemd)
-coinalyze_collector.py    # 15m forward OI + liquidation collector
-mainnet_monitor.py        # read-only mainnet V4 condition monitor
-
 # Telemetry + tracking
 condition_logger.py       # per-condition pass/fail logging every loop
 forward_tracker.py        # live trade vs backtest comparison tracking
-data_validator.py         # data quality plausibility checks
 
 # Historical data fetchers
 bitmex_public_fetcher.py  # DEPRECATED — BitMEX dumps lack liquidation flags (L28)
 binance_data_fetcher.py   # Binance OI + funding (free API)
-fetch_coinalyze.py        # Coinalyze daily OI + liquidations
 
 # Backtesting
 backtest.py               # V2 funding rate backtest
-backtest_v3.py            # V4 daily backtest (original data)
-backtest_v4_extended.py   # V4 backtest on extended 2019-2026 data
-walk_forward.py           # walk-forward out-of-sample validation
 exec_simulator.py         # 1m micro-execution simulator
 
 # Dashboard + utilities
-dashboard.py              # Flask web dashboard (auth required)
+dashboard.py              # Flask web dashboard (HTTP Basic Auth)
 audit.py                  # trade log auditing
 universe_builder.py       # survivorship-bias-free asset universe
+weekly_report.sh          # weekly status report (cron, every Mon 09:00)
 
 # Analysis scripts (one-shot, kept for reference)
 v2_signal_audit.py        # V2 funding regime audit (L30)
 vol_regime_backtest.py    # Vol regime V1 backtest (DEAD — L29)
 vol_regime_v2_directional.py  # Vol regime V2 directional (DEAD — L29)
-analyze_binding_constraint.py # V4 condition frequency analysis
 fold3_autopsy.py          # Vol regime fold-3 kill rule autopsy (L29)
 
 # Dead studies (graveyard, kept for historical reference)
@@ -98,10 +87,9 @@ cointegration_study.py    # Pairs/stat-arb study (DEAD — L20-L21)
 funding_study.py          # Funding settlement study (DEAD — L19)
 momentum_backtest.py      # Cross-sectional momentum (DEAD — L24-L25)
 
-# Tests
+# Tests (46 total)
 test_risk.py              # 34 risk rule tests
-test_signals.py           # 21 signal tests
-test_v4_recovery.py       # 7 V4 crash recovery tests
+test_signals.py           # 12 signal tests
 ```
 
 ## Data Sources
@@ -111,29 +99,16 @@ test_v4_recovery.py       # 7 V4 crash recovery tests
 - **BitMEX public dumps** — DOES NOT contain liquidation flags; `bitmex_public_fetcher.py` is deprecated (see L28)
 - **Binance Futures API** — OI + funding history (geo-blocked from current region, `binance_data_fetcher.py` exists but returns 403)
 
-## V4 Recovery Flow
-State machine: `IDLE → ARMED → POSITION_OPEN → COOLDOWN → IDLE`
-State persists to `data/v4_state.db`. On restart:
-- `IDLE` → no action needed
-- `ARMED` → retry execution immediately
-- `POSITION_OPEN` → check exchange for open position; if closed, detect SL/TP/manual exit
-- `COOLDOWN` → check if cooldown expired; if yes, transition to IDLE
-
 ## Running
 ```bash
 # Main loop (V2)
 cd ~/BitMexBot && source venv/bin/activate && python main.py
 
-# Tests (53 total)
-python -m pytest test_risk.py test_signals.py test_v4_recovery.py -v
+# Tests (46 total)
+python -m pytest test_risk.py test_signals.py -v
 
 # V2 funding rate backtest
 python backtest.py
-
-# V4 backtests
-python backtest_v3.py               # original Coinalyze data
-python backtest_v4_extended.py      # extended data with pre-registered params
-python walk_forward.py              # walk-forward OOS validation
 
 # Historical studies (mostly dead, kept for reference)
 python vol_regime_backtest.py       # DEAD — see L29
@@ -158,14 +133,14 @@ sudo systemctl status bitmexdash.service  # web dashboard
 - [x] Phase 6: Logging + monitoring + dashboard
 - [x] Phase 7: ~~Multi-strategy engine (S1-S4)~~ (killed in V2 rewrite — L26 graveyard)
 - [x] Phase 8: V2 Funding Rate Mean-Reversion (live, currently regime-silent)
-- [x] Phase 9: V4 Cascade Dip-Buy (separate service, data-blocked at N=4)
+- [x] Phase 9: V4 Cascade Dip-Buy — killed at N=4 statistical validation, code deleted 2026-04-22 (graveyard L31)
 - [x] Phase 10: 16-item audit remediation (all engineering complete, see `tasks/todo.md`)
 - [ ] Phase 11: Next surviving strategy (TBD — funding exhaustion / other hypotheses)
 
 ## Audit Protocol
 When asked to audit this codebase:
 1. Read this file completely before touching anything
-2. Run `python -m pytest test_risk.py test_signals.py test_v4_recovery.py -v` — all 53 must pass before and after any change
+2. Run `python -m pytest test_risk.py test_signals.py -v` — all 46 must pass before and after any change
 3. Check for ghost references: grep for any import or reference to files that don't exist
 4. Read `tasks/lessons.md` before proposing any new strategy — do not propose strategies already in the graveyard
 5. Pre-register parameters in a timestamped comment block before running any backtest
@@ -190,6 +165,7 @@ Before running ANY backtest:
 | Family | Lesson | Why Dead |
 |--------|--------|----------|
 | V1-V3 indicators (EMA/RSI/BB) | L01, L26 | Lagging indicators on perpetual futures have no edge |
+| V4 Cascade Dip-Buy (funding-extreme + liq spike + bull regime) | L31 | Data-blocked at N=4 — Coinalyze 15m retention too short to validate before regime shifts; code deleted 2026-04-22 |
 | S1-S4 multi-strategy engine | L26 | Removed in V2 rewrite, ghost code cleaned 2026-04-09 |
 | V2 Funding Rate Mean-Reversion | L19, L30 | Funding regime structurally died mid-2024 (0% of bars hit 0.05% in 2026) |
 | V3 Triple Condition | L04, L05 | Logical paradox: mean-reversion trigger + trend-following filter |

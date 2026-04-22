@@ -11,11 +11,11 @@ the full signal doesn't trigger. This captures "free data" about:
 Data stored in data/condition_log.db (SQLite, WAL mode).
 
 Usage:
-  from condition_logger import get_logger, log_condition, log_v4_conditions, log_v2_conditions
+  from condition_logger import get_logger, log_condition, log_v2_conditions
 
   conn = get_logger()
-  log_condition(conn, "V4", "bull_regime", True, 85200.0, 82000.0)
-  log_v4_conditions(conn, macro_state, micro_data)
+  log_condition(conn, "V2", "funding_extreme", False, 0.00012, 0.0005)
+  log_v2_conditions(conn, funding_rate=0.00012, funding_threshold=0.0005)
 """
 
 import os
@@ -98,49 +98,6 @@ def log_condition(conn: sqlite3.Connection, strategy: str, condition_name: str,
          current_value, threshold, round(distance_pct, 4))
     )
     conn.commit()
-
-
-# ---------------------------------------------------------------------------
-# V4 convenience — log all 4 conditions at once
-# ---------------------------------------------------------------------------
-def log_v4_conditions(conn: sqlite3.Connection,
-                      close: float = None, ema200: float = None,
-                      funding_peak: float = None, funding_threshold: float = None,
-                      liq_ratio: float = None, liq_spike_mult: float = None,
-                      liq_long_pct: float = None, liq_long_dom: float = None,
-                      oi_delta_pct: float = None):
-    """
-    Log all V4 macro + micro conditions in one call.
-    Pass whatever data is available; conditions with None values are skipped.
-    """
-    # C1: Bull regime (close > EMA200)
-    if close is not None and ema200 is not None:
-        log_condition(conn, "V4", "bull_regime",
-                     close > ema200, close, ema200)
-
-    # C2: Funding setup (peak > threshold)
-    if funding_peak is not None and funding_threshold is not None:
-        log_condition(conn, "V4", "funding_setup",
-                     funding_peak > funding_threshold,
-                     funding_peak, funding_threshold)
-
-    # C3: Liquidation spike (ratio >= mult)
-    if liq_ratio is not None and liq_spike_mult is not None:
-        log_condition(conn, "V4", "liq_spike",
-                     liq_ratio >= liq_spike_mult,
-                     liq_ratio, liq_spike_mult)
-
-    # C3b: Long dominance (long_pct >= threshold)
-    if liq_long_pct is not None and liq_long_dom is not None:
-        log_condition(conn, "V4", "liq_long_dominance",
-                     liq_long_pct >= liq_long_dom,
-                     liq_long_pct, liq_long_dom)
-
-    # C4: OI confirmation (delta < 0)
-    if oi_delta_pct is not None:
-        log_condition(conn, "V4", "oi_confirm",
-                     oi_delta_pct < 0,
-                     oi_delta_pct, 0)
 
 
 # ---------------------------------------------------------------------------
