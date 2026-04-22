@@ -371,7 +371,7 @@ _HTML = r"""<!DOCTYPE html>
     <div class="card">
       <h3>Recent Closed Trades</h3>
       <table>
-        <thead><tr><th>Time</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th></tr></thead>
+        <thead><tr><th>Time</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Closed By</th></tr></thead>
         <tbody id="trades-body"><tr><td class="empty" colspan="6">No trades yet.</td></tr></tbody>
       </table>
     </div>
