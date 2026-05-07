@@ -37,9 +37,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+          python -m pip install pytest
 
       - name: Run risk tests
-        run: python -m unittest discover -v
+        run: python -m unittest test_logger test_risk -v
 
       - name: Run signal tests
-        run: python test_signals.py
+        run: python -m pytest test_signals.py -v
