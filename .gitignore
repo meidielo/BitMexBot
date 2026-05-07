@@ -1,5 +1,6 @@
 # Credentials — never commit
 .env
+.claude/
 .env.*
 !.env.example
 /.credentials

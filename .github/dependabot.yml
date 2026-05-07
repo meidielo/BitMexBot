@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Australia/Sydney"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "security"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    allow:
+      - dependency-name: "aiohttp"
+      - dependency-name: "cryptography"
+      - dependency-name: "requests"
+    groups:
+      security-runtime-pins:
+        patterns:
+          - "aiohttp"
+          - "cryptography"
+          - "requests"
