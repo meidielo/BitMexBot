@@ -95,7 +95,8 @@ main.py              V2 15-minute loop orchestrator
 ## Tests
 
 ```bash
-python -m pytest test_risk.py test_signals.py -v   # 46 tests
+python -m unittest discover -v
+python test_signals.py
 ```
 
 ## Exchange Details

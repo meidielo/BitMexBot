@@ -17,10 +17,12 @@ updates:
     allow:
       - dependency-name: "aiohttp"
       - dependency-name: "cryptography"
+      - dependency-name: "flask"
       - dependency-name: "requests"
     groups:
       security-runtime-pins:
         patterns:
           - "aiohttp"
           - "cryptography"
+          - "flask"
           - "requests"
