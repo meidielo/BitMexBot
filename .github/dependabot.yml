@@ -19,6 +19,7 @@ updates:
       - dependency-name: "cryptography"
       - dependency-name: "flask"
       - dependency-name: "requests"
+      - dependency-name: "urllib3"
     groups:
       security-runtime-pins:
         patterns:
@@ -26,3 +27,4 @@ updates:
           - "cryptography"
           - "flask"
           - "requests"
+          - "urllib3"
