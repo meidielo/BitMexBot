@@ -71,7 +71,7 @@ backtest.py               # V2 funding rate backtest
 exec_simulator.py         # 1m micro-execution simulator
 
 # Dashboard + utilities
-dashboard.py              # Flask web dashboard (HTTP Basic Auth)
+dashboard.py              # Flask read-only web dashboard
 audit.py                  # trade log auditing
 universe_builder.py       # survivorship-bias-free asset universe
 weekly_report.sh          # weekly status report (cron, every Mon 09:00)
@@ -114,7 +114,7 @@ python backtest.py
 python vol_regime_backtest.py       # DEAD — see L29
 python v2_signal_audit.py           # funding regime audit (L30)
 
-# Dashboard (requires DASH_USER/DASH_PASS in .env)
+# Dashboard
 python dashboard.py
 ```
 

@@ -63,7 +63,7 @@ pip install -r requirements.txt
 
 # Configure
 cp .env.example .env
-# Edit .env with your BitMEX testnet API keys + dashboard credentials
+# Edit .env with your BitMEX testnet API keys
 
 # Run
 python main.py
@@ -87,7 +87,7 @@ main.py              V2 15-minute loop orchestrator
 
 | Script | Purpose |
 |--------|---------|
-| `dashboard.py` | Flask web dashboard (HTTP Basic Auth, port 5000) |
+| `dashboard.py` | Flask read-only web dashboard (port 5000) |
 | `backtest.py` | V2 funding-rate backtest |
 | `audit.py` | Trade-log audit + summary statistics |
 | `weekly_report.sh` | Weekly project status (cron, every Monday 09:00) |

@@ -16,15 +16,10 @@ import json
 import os
 import re
 import sqlite3
-import sys
 import time as _time
 from datetime import datetime, timezone
 
-from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string
-from flask_httpauth import HTTPBasicAuth
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -43,17 +38,6 @@ LOG_TAIL   = 120
 DASH_PORT  = 5000
 
 app = Flask(__name__)
-auth = HTTPBasicAuth()
-
-DASH_USER = os.environ.get("DASH_USER")
-DASH_PASS = os.environ.get("DASH_PASS")
-
-
-@auth.verify_password
-def verify_password(username, password):
-    if username == DASH_USER and password == DASH_PASS:
-        return username
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -505,25 +489,16 @@ refresh();
 
 
 @app.route("/")
-@auth.login_required
 def index():
     return render_template_string(_HTML)
 
 
 @app.route("/api/data")
-@auth.login_required
 def api_data():
     return jsonify(_collect())
 
 
 if __name__ == "__main__":
-    if not DASH_USER or not DASH_PASS:
-        print("[FATAL] DASH_USER and DASH_PASS must be set in .env")
-        print("  Add these lines to your .env file:")
-        print("    DASH_USER=admin")
-        print("    DASH_PASS=your_secure_password_here")
-        sys.exit(1)
-
     bind_host = "0.0.0.0"
     try:
         import subprocess
