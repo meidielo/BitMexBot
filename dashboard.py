@@ -127,15 +127,12 @@ def _parse_latest_diagnostics() -> dict:
 
 
 def _connect_research_db() -> sqlite3.Connection:
-    try:
-        return sqlite3.connect(RESEARCH_DB_PATH, timeout=5)
-    except sqlite3.OperationalError:
-        uri_path = os.path.abspath(RESEARCH_DB_PATH).replace("\\", "/")
-        return sqlite3.connect(
-            f"file:{uri_path}?mode=ro&immutable=1",
-            uri=True,
-            timeout=5,
-        )
+    uri_path = os.path.abspath(RESEARCH_DB_PATH).replace("\\", "/")
+    return sqlite3.connect(
+        f"file:{uri_path}?mode=ro&immutable=1",
+        uri=True,
+        timeout=5,
+    )
 
 
 def _research_snapshot() -> dict:
