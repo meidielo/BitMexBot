@@ -93,6 +93,7 @@ main.py              V2 15-minute loop orchestrator
 | `backtest.py` | V2 funding-rate backtest |
 | `audit.py` | Trade-log audit + summary statistics |
 | `research_scanner.py` | Read-only multi-symbol shadow scanner; writes watch-only candidate signals to `data/research_signals.db` |
+| `live_readiness.py` | Read-only live-readiness and no-go gate evaluator; never enables live trading |
 | `weekly_report.sh` | Weekly project status (cron, every Monday 09:00) |
 
 ## Research / Shadow Mode
@@ -112,10 +113,22 @@ The scanner currently tracks BitMEX public-data candidates across BTC, ETH, SOL,
 
 Outputs are `WATCH_LONG`, `WATCH_SHORT`, or `NO_SIGNAL`. They are not trade orders, and the live testnet guards remain unchanged.
 
+## Live Readiness / No-Go Gate
+
+The project has a read-only readiness evaluator:
+
+```bash
+python live_readiness.py
+```
+
+It defaults to `NOT_READY` until hard evidence clears every gate: confirmed testnet environment, enough closed testnet trades, positive sample PnL, clean risk approvals, clean position-size audit, daily halt evidence, fresh shadow scanner data, and enough watch candidates. It also keeps no-go rules for deciding when a candidate should not be promoted, such as a negative 30+ trade sample or a long shadow period with almost no watch candidates.
+
+This script does not switch the bot to live trading. It only reports whether the evidence is strong enough for manual review.
+
 ## Tests
 
 ```bash
-python -m unittest test_logger test_risk test_research_scanner -v
+python -m unittest test_logger test_risk test_research_scanner test_live_readiness -v
 python -m pytest test_signals.py -v
 ```
 

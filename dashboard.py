@@ -21,6 +21,11 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, render_template_string
 
+try:
+    from live_readiness import evaluate_live_readiness
+except ImportError:
+    evaluate_live_readiness = None
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -50,9 +55,12 @@ def _query(sql: str, params: tuple = ()) -> list:
     if not os.path.exists(DB_PATH):
         return []
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        conn = sqlite3.connect(DB_PATH)
+        try:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -173,7 +181,8 @@ def _research_snapshot() -> dict:
         return empty
 
     try:
-        with _connect_research_db() as conn:
+        conn = _connect_research_db()
+        try:
             conn.row_factory = sqlite3.Row
             run = conn.execute(
                 """
@@ -220,6 +229,8 @@ def _research_snapshot() -> dict:
                 """,
                 (run["run_id"],),
             ).fetchall()
+        finally:
+            conn.close()
 
         errors = json.loads(run["errors_json"] or "[]")
         status = "Collecting shadow signals"
@@ -239,6 +250,36 @@ def _research_snapshot() -> dict:
         }
     except Exception as exc:
         return {**empty, "status": f"Shadow scanner read error: {type(exc).__name__}"}
+
+
+def _readiness_snapshot() -> dict:
+    if evaluate_live_readiness is None:
+        return {
+            "verdict": "UNAVAILABLE",
+            "headline": "Readiness evaluator unavailable.",
+            "decision": "Dashboard could not import live_readiness.py.",
+            "failed_gates": 0,
+            "total_gates": 0,
+            "gates": [],
+            "no_go_rules": [],
+        }
+
+    try:
+        return evaluate_live_readiness(
+            trade_db_path=DB_PATH,
+            research_db_path=RESEARCH_DB_PATH,
+            read_only=True,
+        )
+    except Exception as exc:
+        return {
+            "verdict": "UNAVAILABLE",
+            "headline": f"Readiness evaluator error: {type(exc).__name__}",
+            "decision": "Keep the bot in testnet mode until this is fixed.",
+            "failed_gates": 0,
+            "total_gates": 0,
+            "gates": [],
+            "no_go_rules": [],
+        }
 
 
 def _collect() -> dict:
@@ -306,6 +347,7 @@ def _collect() -> dict:
         "diagnostics":     _parse_latest_diagnostics(),
         "equity_curve":    equity_curve,
         "research":        _research_snapshot(),
+        "readiness":       _readiness_snapshot(),
     }
 
 
@@ -400,6 +442,30 @@ _HTML = r"""<!DOCTYPE html>
   .research-diag-label { color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px; }
   .research-diag-value { color: #d8d8d8; white-space: nowrap; }
 
+  /* Live readiness */
+  .readiness-head { display: grid; grid-template-columns: 220px 1fr 140px; gap: 14px; align-items: center; margin-bottom: 12px; }
+  .readiness-verdict { border-radius: 6px; padding: 12px; border: 1px solid #333; background: #111; }
+  .readiness-verdict .k { color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+  .readiness-verdict .v { color: #fff; font-size: 20px; font-weight: bold; overflow-wrap: anywhere; }
+  .readiness-verdict.not-ready { border-color: #8a5a16; background: #211708; }
+  .readiness-verdict.reject { border-color: #8a1c1c; background: #220b0b; }
+  .readiness-verdict.review { border-color: #1b5e20; background: #0c1c0d; }
+  .readiness-copy { color: #bbb; font-size: 13px; line-height: 1.5; }
+  .readiness-count { text-align: right; color: #aaa; font-size: 12px; }
+  .readiness-count strong { display: block; color: #fff; font-size: 24px; }
+  .gate-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+  .gate-item { background: #111; border: 1px solid #242424; border-radius: 6px; padding: 10px; }
+  .gate-top { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+  .gate-name { color: #fff; font-size: 13px; font-weight: bold; }
+  .gate-detail { color: #888; font-size: 12px; line-height: 1.4; }
+  .pill { display: inline-block; min-width: 44px; text-align: center; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
+  .pill-pass { color: #a5d6a7; background: #1b5e2033; border: 1px solid #1b5e20; }
+  .pill-fail { color: #ef9a9a; background: #b71c1c33; border: 1px solid #b71c1c; }
+  .pill-warn, .pill-armed, .pill-pending { color: #ffcc80; background: #8a5a1633; border: 1px solid #8a5a16; }
+  .pill-clear { color: #a5d6a7; background: #1b5e2033; border: 1px solid #1b5e20; }
+  .pill-triggered { color: #ef9a9a; background: #b71c1c33; border: 1px solid #b71c1c; }
+  .nogo-list { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+
   /* Log */
   .log-box { background: #0a0a0a; border: 1px solid #1e1e1e; border-radius: 6px; padding: 12px; height: 350px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 12px; line-height: 1.6; }
   .log-line { white-space: pre-wrap; word-break: break-all; }
@@ -420,6 +486,8 @@ _HTML = r"""<!DOCTYPE html>
     .research-strip { grid-template-columns: repeat(2, 1fr); }
     .research-row { grid-template-columns: 1fr; gap: 4px; }
     .research-diag { grid-template-columns: 1fr 1fr; }
+    .readiness-head, .gate-grid, .nogo-list { grid-template-columns: 1fr; }
+    .readiness-count { text-align: left; }
     .research-reason { white-space: normal; }
   }
 </style>
@@ -487,6 +555,28 @@ _HTML = r"""<!DOCTYPE html>
     <div class="research-list" id="research-list">
       <div class="empty">No shadow scanner data yet.</div>
     </div>
+  </div>
+
+  <!-- Row 4: Live readiness -->
+  <div class="card" style="margin-bottom:20px;">
+    <h3>Live Readiness / No-Go</h3>
+    <div class="readiness-head">
+      <div class="readiness-verdict not-ready" id="readiness-verdict">
+        <div class="k">Verdict</div>
+        <div class="v" id="readiness-verdict-text">--</div>
+      </div>
+      <div class="readiness-copy">
+        <div id="readiness-headline">Loading readiness evaluator...</div>
+        <div class="card-sub" id="readiness-decision">--</div>
+      </div>
+      <div class="readiness-count">
+        Failed gates
+        <strong id="readiness-failed">--</strong>
+        <span id="readiness-total">--</span>
+      </div>
+    </div>
+    <div class="gate-grid" id="readiness-gates"></div>
+    <div class="nogo-list" id="readiness-nogo"></div>
   </div>
 
   <!-- Row 5: Equity curve -->
@@ -573,6 +663,45 @@ function researchDiagnostics(rows) {
       breakout: `up ${fmtPct(upGap)} / down ${fmtPct(downGap)}`,
     };
   });
+}
+function readinessClass(verdict) {
+  if (verdict === 'READY_FOR_MANUAL_REVIEW') return 'review';
+  if (verdict === 'REJECT_DO_NOT_PROMOTE') return 'reject';
+  return 'not-ready';
+}
+function pillClass(status) {
+  return `pill-${String(status || '').toLowerCase().replace(/_/g, '-')}`;
+}
+function renderGate(item) {
+  const status = item.status || '--';
+  return `<div class="gate-item">
+    <div class="gate-top">
+      <span class="pill ${pillClass(status)}">${esc(status)}</span>
+      <span class="gate-name">${esc(item.name || '--')}</span>
+    </div>
+    <div class="gate-detail">${esc(item.detail || '')}</div>
+  </div>`;
+}
+function renderReadiness(readiness) {
+  readiness = readiness || {};
+  const verdict = readiness.verdict || 'UNAVAILABLE';
+  const verdictBox = document.getElementById('readiness-verdict');
+  verdictBox.className = `readiness-verdict ${readinessClass(verdict)}`;
+  document.getElementById('readiness-verdict-text').textContent = verdict.replace(/_/g, ' ');
+  document.getElementById('readiness-headline').textContent = readiness.headline || '--';
+  document.getElementById('readiness-decision').textContent = readiness.decision || '--';
+  document.getElementById('readiness-failed').textContent = readiness.failed_gates ?? '--';
+  document.getElementById('readiness-total').textContent = `of ${readiness.total_gates ?? '--'}`;
+
+  const gates = readiness.gates || [];
+  document.getElementById('readiness-gates').innerHTML = gates.length
+    ? gates.map(renderGate).join('')
+    : '<div class="empty">No readiness gates available.</div>';
+
+  const rules = readiness.no_go_rules || [];
+  document.getElementById('readiness-nogo').innerHTML = rules.length
+    ? rules.map(renderGate).join('')
+    : '<div class="empty">No no-go rules available.</div>';
 }
 
 function colorLog(line) {
@@ -704,6 +833,9 @@ async function refresh() {
 
   // Research scanner
   renderResearch(d.research);
+
+  // Live readiness / no-go rules
+  renderReadiness(d.readiness);
 
   // Open positions
   const ob = document.getElementById('open-body');

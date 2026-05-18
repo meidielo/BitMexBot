@@ -136,12 +136,17 @@ echo ""
 echo "## Research Scanner"
 python3 research_scanner.py --scorecard-only 2>/dev/null || echo "  Research scanner: unavailable"
 
+# Live readiness
+echo ""
+echo "## Live Readiness"
+python3 live_readiness.py --read-only 2>/dev/null | sed -n '1,8p' || echo "  Live readiness: unavailable"
+
 # Codebase health
 echo ""
 echo "## Codebase Health"
 UNIT_LOG=$(mktemp)
 PYTEST_LOG=$(mktemp)
-python -m unittest test_logger test_risk test_research_scanner -v >"$UNIT_LOG" 2>&1
+python -m unittest test_logger test_risk test_research_scanner test_live_readiness -v >"$UNIT_LOG" 2>&1
 UNIT_STATUS=$?
 python -m pytest test_signals.py -q >"$PYTEST_LOG" 2>&1
 PYTEST_STATUS=$?
