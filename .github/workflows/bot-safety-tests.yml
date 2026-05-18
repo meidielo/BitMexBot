@@ -39,8 +39,8 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pytest
 
-      - name: Run risk tests
-        run: python -m unittest test_logger test_risk -v
+      - name: Run risk and research safety tests
+        run: python -m unittest test_logger test_risk test_research_scanner -v
 
       - name: Run signal tests
         run: python -m pytest test_signals.py -v

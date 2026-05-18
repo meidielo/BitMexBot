@@ -6,6 +6,8 @@ A BitMEX testnet trading bot built as a learning project. Python 3.12, ccxt, pan
 
 Runs a 15-minute loop: fetch candles from mainnet (public data) -> evaluate V2 Funding Rate Mean-Reversion signal -> validate risk -> execute orders on testnet -> log to SQLite + condition telemetry.
 
+The live bot remains testnet-only. New strategy ideas should first go through read-only shadow tracking in `research_scanner.py`, which records watch-only candidate signals without importing the order manager, risk layer, API keys, or execution code.
+
 ## Current Strategy Status
 
 | Strategy | File | Status |
@@ -90,12 +92,30 @@ main.py              V2 15-minute loop orchestrator
 | `dashboard.py` | Flask read-only web dashboard (port 5000) |
 | `backtest.py` | V2 funding-rate backtest |
 | `audit.py` | Trade-log audit + summary statistics |
+| `research_scanner.py` | Read-only multi-symbol shadow scanner; writes watch-only candidate signals to `data/research_signals.db` |
 | `weekly_report.sh` | Weekly project status (cron, every Monday 09:00) |
+
+## Research / Shadow Mode
+
+Use testnet to validate plumbing and operational discipline, not to prove a trading edge. Candidate strategies are trained as shadow observations first:
+
+```bash
+python research_scanner.py --once
+python research_scanner.py --scorecard-only
+```
+
+The scanner currently tracks BitMEX public-data candidates across BTC, ETH, SOL, and XRP USDT swaps:
+
+- `btc_trend_breakout_vol_filter`: 20-bar breakout with EMA200, volatility, and volume filters.
+- `vol_spike_reversion_proxy`: high-volume range shock proxy for possible mean reversion.
+- `funding_extreme_watch`: lower-threshold funding watchlist for squeeze candidates.
+
+Outputs are `WATCH_LONG`, `WATCH_SHORT`, or `NO_SIGNAL`. They are not trade orders, and the live testnet guards remain unchanged.
 
 ## Tests
 
 ```bash
-python -m unittest test_logger test_risk -v
+python -m unittest test_logger test_risk test_research_scanner -v
 python -m pytest test_signals.py -v
 ```
 

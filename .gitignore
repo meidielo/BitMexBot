@@ -1,6 +1,7 @@
 # Credentials — never commit
 .env
 .claude/
+AGENTS.md.before-codex-memory-import-*
 .env.*
 !.env.example
 /.credentials
