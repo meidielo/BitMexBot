@@ -8,7 +8,13 @@
 
 HEARTBEAT="$HOME/BitMexBot/data/coinalyze_heartbeat.txt"
 ALERT_LOG="$HOME/BitMexBot/data/collector_alerts.log"
+COLLECTOR="$HOME/BitMexBot/coinalyze_collector.py"
 MAX_AGE_SEC=1800  # 30 minutes
+
+if [ ! -f "$COLLECTOR" ]; then
+    echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [INFO] Coinalyze collector script missing or retired; heartbeat check skipped." >> "$ALERT_LOG"
+    exit 0
+fi
 
 if [ ! -f "$HEARTBEAT" ]; then
     echo "$(date -u '+%Y-%m-%d %H:%M:%S UTC') [ALERT] Heartbeat file missing: $HEARTBEAT" >> "$ALERT_LOG"

@@ -38,24 +38,51 @@ except: print('  Funding: unavailable')
 # Services
 echo ""
 echo "## Services"
-for svc in bitmexbot bitmexdash bitmexv4; do
-    STATUS=$(systemctl is-active ${svc}.service 2>/dev/null) || true
-    echo "  ${svc}: ${STATUS:-unknown}"
-done
+if command -v docker >/dev/null 2>&1 && docker compose ps >/dev/null 2>&1; then
+    for svc in bitmexbot bitmexdash; do
+        CID=$(docker compose ps -q "$svc" 2>/dev/null)
+        if [ -n "$CID" ]; then
+            STATE=$(docker inspect -f '{{.State.Status}}' "$CID" 2>/dev/null)
+            HEALTH=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$CID" 2>/dev/null)
+            echo "  ${svc}: docker ${STATE:-unknown} (${HEALTH:-unknown})"
+        else
+            echo "  ${svc}: docker not running"
+        fi
+    done
+else
+    for svc in bitmexbot bitmexdash; do
+        STATUS=$(systemctl is-active ${svc}.service 2>/dev/null) || true
+        echo "  ${svc}: systemd ${STATUS:-unknown}"
+    done
+fi
+echo "  bitmexv4: retired"
+
+# Container inventory
+echo ""
+echo "## Container Inventory"
+if command -v docker >/dev/null 2>&1; then
+    docker ps --format '  {{.Names}}: {{.Status}}' | sort
+else
+    echo "  Docker: unavailable"
+fi
 
 # Data pipeline
 echo ""
 echo "## Data Pipeline"
-if [ -f data/coinalyze_heartbeat.txt ]; then
-    AGE_SEC=$(( $(date +%s) - $(stat -c %Y data/coinalyze_heartbeat.txt) ))
-    AGE_MIN=$(( AGE_SEC / 60 ))
-    if [ $AGE_MIN -gt 120 ]; then
-        echo "  Coinalyze collector: STALE (${AGE_MIN}m old)"
+if [ -f coinalyze_collector.py ]; then
+    if [ -f data/coinalyze_heartbeat.txt ]; then
+        AGE_SEC=$(( $(date +%s) - $(stat -c %Y data/coinalyze_heartbeat.txt) ))
+        AGE_MIN=$(( AGE_SEC / 60 ))
+        if [ $AGE_MIN -gt 120 ]; then
+            echo "  Coinalyze collector: STALE (${AGE_MIN}m old)"
+        else
+            echo "  Coinalyze collector: OK (${AGE_MIN}m old)"
+        fi
     else
-        echo "  Coinalyze collector: OK (${AGE_MIN}m old)"
+        echo "  Coinalyze collector: NO HEARTBEAT FILE"
     fi
 else
-    echo "  Coinalyze collector: NO HEARTBEAT FILE"
+    echo "  Coinalyze collector: retired or missing script"
 fi
 
 # Use Python for all SQLite queries (sqlite3 CLI not reliably in PATH)
@@ -107,7 +134,20 @@ with open(state_file, 'w') as f:
 # Codebase health
 echo ""
 echo "## Codebase Health"
-TEST_OUT=$(python -m pytest test_risk.py test_signals.py test_v4_recovery.py -q 2>&1 | tail -1)
+UNIT_LOG=$(mktemp)
+PYTEST_LOG=$(mktemp)
+python -m unittest test_logger test_risk -v >"$UNIT_LOG" 2>&1
+UNIT_STATUS=$?
+python -m pytest test_signals.py -q >"$PYTEST_LOG" 2>&1
+PYTEST_STATUS=$?
+if [ "$UNIT_STATUS" -eq 0 ] && [ "$PYTEST_STATUS" -eq 0 ]; then
+    UNIT_COUNT=$(grep -E '^Ran [0-9]+ tests' "$UNIT_LOG" | tail -1 | awk '{print $2}')
+    PYTEST_OUT=$(tail -1 "$PYTEST_LOG")
+    TEST_OUT="unittest ${UNIT_COUNT:-?} passed; pytest ${PYTEST_OUT}"
+else
+    TEST_OUT="FAILED: unittest exit ${UNIT_STATUS}, pytest exit ${PYTEST_STATUS}"
+fi
+rm -f "$UNIT_LOG" "$PYTEST_LOG"
 echo "  Tests: $TEST_OUT"
 COMMITS_7D=$(git log --oneline --since="7 days ago" 2>/dev/null | wc -l)
 echo "  Commits (last 7d): $COMMITS_7D"
