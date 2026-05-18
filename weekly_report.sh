@@ -189,7 +189,17 @@ if os.path.exists(trades):
         signal = row['signal']
         entry_price = row['entry_price']
         print(f'  Last trade: {timestamp} UTC ({days:.1f} days ago), {signal} at {entry_price:,.1f}')
-        print(f'  Trade log open rows: {open_count}')
+        print(f'  Trade log unclosed rows: {open_count} (historical log cleanup, not live exposure)')
+
+try:
+    from bitmex_client import get_client
+    exchange = get_client()
+    positions = exchange.fetch_positions(['XBTUSDT'])
+    active = [p for p in positions if float(p.get('contracts') or 0) != 0]
+    open_orders = exchange.fetch_open_orders('XBTUSDT')
+    print(f'  Exchange live exposure: {len(active)} active positions, {len(open_orders)} open orders')
+except Exception as exc:
+    print(f'  Exchange live exposure: unavailable ({type(exc).__name__})')
 
 if os.path.exists(conditions):
     conn = sqlite3.connect(conditions)
