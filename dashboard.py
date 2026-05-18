@@ -37,6 +37,7 @@ except ImportError:
 
 LOG_TAIL   = 120
 DASH_PORT  = 5000
+RESEARCH_CRON_MINUTE = 7
 
 app = Flask(__name__)
 
@@ -135,6 +136,25 @@ def _connect_research_db() -> sqlite3.Connection:
     )
 
 
+def _next_research_run() -> str:
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    candidate = now.replace(minute=RESEARCH_CRON_MINUTE)
+    if candidate <= now:
+        candidate += timedelta(hours=1)
+    return candidate.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _research_row(row: sqlite3.Row) -> dict:
+    item = dict(row)
+    raw = item.pop("metadata_json", "") or "{}"
+    try:
+        metadata = json.loads(raw)
+    except json.JSONDecodeError:
+        metadata = {}
+    item["metadata"] = metadata if isinstance(metadata, dict) else {}
+    return item
+
+
 def _research_snapshot() -> dict:
     """Return latest read-only shadow scanner status for the dashboard."""
     empty = {
@@ -144,6 +164,7 @@ def _research_snapshot() -> dict:
         "symbols_scanned": 0,
         "rows_7d": 0,
         "watch_7d": 0,
+        "next_run": _next_research_run(),
         "watchlist": [],
         "latest_signals": [],
     }
@@ -182,7 +203,7 @@ def _research_snapshot() -> dict:
             ).fetchone()[0]
             watchlist = conn.execute(
                 """
-                SELECT timestamp_utc, strategy, symbol, action, score, reason
+                SELECT timestamp_utc, strategy, symbol, action, score, reason, metadata_json
                 FROM research_signals
                 WHERE action != 'NO_SIGNAL'
                 ORDER BY timestamp_utc DESC, score DESC
@@ -191,7 +212,7 @@ def _research_snapshot() -> dict:
             ).fetchall()
             latest_signals = conn.execute(
                 """
-                SELECT strategy, symbol, action, score, reason
+                SELECT strategy, symbol, action, score, reason, metadata_json
                 FROM research_signals
                 WHERE run_id = ?
                 ORDER BY action != 'NO_SIGNAL' DESC, score DESC, symbol, strategy
@@ -212,8 +233,9 @@ def _research_snapshot() -> dict:
             "symbols_scanned": run["symbols_scanned"],
             "rows_7d": rows_7d,
             "watch_7d": watch_7d,
-            "watchlist": [dict(row) for row in watchlist],
-            "latest_signals": [dict(row) for row in latest_signals],
+            "next_run": _next_research_run(),
+            "watchlist": [_research_row(row) for row in watchlist],
+            "latest_signals": [_research_row(row) for row in latest_signals],
         }
     except Exception as exc:
         return {**empty, "status": f"Shadow scanner read error: {type(exc).__name__}"}
@@ -359,7 +381,7 @@ _HTML = r"""<!DOCTYPE html>
   .empty { color: #444; font-style: italic; padding: 12px 8px; }
 
   /* Research scanner */
-  .research-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 12px 0; }
+  .research-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 12px 0; }
   .research-metric { background: #111; border: 1px solid #242424; border-radius: 6px; padding: 10px; }
   .research-metric .k { color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
   .research-metric .v { color: #fff; font-size: 18px; font-weight: bold; }
@@ -368,6 +390,15 @@ _HTML = r"""<!DOCTYPE html>
   .research-row:last-child { border-bottom: 0; }
   .research-row:hover { background: #1f1f1f; }
   .research-reason { color: #aaa; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .research-quiet { padding: 14px 16px; border-bottom: 1px solid #202020; }
+  .research-quiet-title { color: #fff; font-size: 18px; font-weight: bold; margin-bottom: 4px; }
+  .research-quiet-sub { color: #777; font-size: 12px; }
+  .research-diag { display: grid; grid-template-columns: 120px repeat(4, 1fr); gap: 10px; padding: 9px 10px; border-bottom: 1px solid #202020; align-items: center; font-size: 12px; }
+  .research-diag:last-child { border-bottom: 0; }
+  .research-diag:hover { background: #1f1f1f; }
+  .research-diag-symbol { color: #fff; font-weight: bold; }
+  .research-diag-label { color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px; }
+  .research-diag-value { color: #d8d8d8; white-space: nowrap; }
 
   /* Log */
   .log-box { background: #0a0a0a; border: 1px solid #1e1e1e; border-radius: 6px; padding: 12px; height: 350px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 12px; line-height: 1.6; }
@@ -388,6 +419,7 @@ _HTML = r"""<!DOCTYPE html>
     .grid-2, .grid-2-1 { grid-template-columns: 1fr; }
     .research-strip { grid-template-columns: repeat(2, 1fr); }
     .research-row { grid-template-columns: 1fr; gap: 4px; }
+    .research-diag { grid-template-columns: 1fr 1fr; }
     .research-reason { white-space: normal; }
   }
 </style>
@@ -447,6 +479,7 @@ _HTML = r"""<!DOCTYPE html>
     <div class="card-sub" id="research-status">Loading shadow scanner...</div>
     <div class="research-strip">
       <div class="research-metric"><div class="k">Latest Run</div><div class="v" id="research-run">--</div></div>
+      <div class="research-metric"><div class="k">Next Run</div><div class="v" id="research-next">--</div></div>
       <div class="research-metric"><div class="k">Symbols</div><div class="v" id="research-symbols">--</div></div>
       <div class="research-metric"><div class="k">Rows 7d</div><div class="v" id="research-rows">--</div></div>
       <div class="research-metric"><div class="k">Watch 7d</div><div class="v" id="research-watch">--</div></div>
@@ -502,6 +535,45 @@ function actionTag(action) {
   const cls = action === 'WATCH_LONG' ? 'tag-long' : action === 'WATCH_SHORT' ? 'tag-short' : '';
   return `<span class="tag ${cls}">${esc(action || '--')}</span>`;
 }
+function fmtPct(v) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return '--';
+  return `${Number(v).toFixed(3)}%`;
+}
+function fmtRatio(v) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return '--';
+  return `${Number(v).toFixed(2)}x`;
+}
+function shortTime(v) {
+  return v ? v.replace('T', ' ').slice(11, 16) + ' UTC' : '--';
+}
+function researchDiagnostics(rows) {
+  const bySymbol = {};
+  (rows || []).forEach(r => {
+    const symbol = r.symbol || '--';
+    bySymbol[symbol] = bySymbol[symbol] || {};
+    bySymbol[symbol][r.strategy] = r;
+  });
+  return Object.entries(bySymbol).map(([symbol, items]) => {
+    const trend = items.btc_trend_breakout_vol_filter || {};
+    const vol = items.vol_spike_reversion_proxy || {};
+    const funding = items.funding_extreme_watch || {};
+    const tm = trend.metadata || {};
+    const vm = vol.metadata || {};
+    const fm = funding.metadata || {};
+    const close = Number(tm.close || vm.close || 0);
+    const upGap = close && tm.prior_high_20 ? (Number(tm.prior_high_20) - close) / close * 100 : null;
+    const downGap = close && tm.prior_low_20 ? (close - Number(tm.prior_low_20)) / close * 100 : null;
+    const fundingRate = fm.funding_rate === null || fm.funding_rate === undefined ? null : Number(fm.funding_rate) * 100;
+    return {
+      symbol,
+      fundingRate,
+      trendVolume: tm.volume_ratio,
+      spikeVolume: vm.volume_ratio,
+      rangeAtr: vm.range_atr_ratio,
+      breakout: `up ${fmtPct(upGap)} / down ${fmtPct(downGap)}`,
+    };
+  });
+}
 
 function colorLog(line) {
   if (line.includes('[SHORT]'))      return `<span class="log-short">${esc(line)}</span>`;
@@ -547,6 +619,7 @@ function renderResearch(research) {
   research = research || {};
   document.getElementById('research-status').textContent = research.status || 'Shadow scanner unavailable';
   document.getElementById('research-run').textContent = research.latest_run ? research.latest_run.replace('T', ' ').slice(0, 16) + ' UTC' : '--';
+  document.getElementById('research-next').textContent = research.next_run ? shortTime(research.next_run) : '--';
   document.getElementById('research-symbols').textContent = research.symbols_scanned ?? '--';
   document.getElementById('research-rows').textContent = research.rows_7d ?? '--';
   document.getElementById('research-watch').innerHTML = `<span class="${(research.watch_7d || 0) > 0 ? 'pos' : 'neu'}">${research.watch_7d ?? '--'}</span>`;
@@ -557,19 +630,38 @@ function renderResearch(research) {
     return;
   }
 
-  const rows = (research.watchlist && research.watchlist.length) ? research.watchlist : (research.latest_signals || []);
-  if (!rows.length) {
-    list.innerHTML = '<div class="empty">Scanner is active, but no candidate rows are available yet.</div>';
+  const watchRows = research.watchlist || [];
+  const latestRows = research.latest_signals || [];
+  if (watchRows.length) {
+    list.innerHTML = watchRows.map(r => `<div class="research-row">
+      <div>${esc(r.symbol || '--')}</div>
+      <div>${esc(r.strategy || '--')}</div>
+      <div>${actionTag(r.action)}</div>
+      <div>${Number(r.score || 0).toFixed(1)}</div>
+      <div class="research-reason" title="${esc(r.reason || '')}">${esc(r.reason || '--')}</div>
+    </div>`).join('');
     return;
   }
 
-  list.innerHTML = rows.map(r => `<div class="research-row">
-    <div>${esc(r.symbol || '--')}</div>
-    <div>${esc(r.strategy || '--')}</div>
-    <div>${actionTag(r.action)}</div>
-    <div>${Number(r.score || 0).toFixed(1)}</div>
-    <div class="research-reason" title="${esc(r.reason || '')}">${esc(r.reason || '--')}</div>
-  </div>`).join('');
+  const diagnostics = researchDiagnostics(latestRows);
+  if (!diagnostics.length) {
+    list.innerHTML = '<div class="empty">Scanner is active, but no diagnostics are available yet.</div>';
+    return;
+  }
+
+  list.innerHTML = `
+    <div class="research-quiet">
+      <div class="research-quiet-title">No watch candidates right now</div>
+      <div class="research-quiet-sub">Latest scanner pass stayed below every watch threshold.</div>
+    </div>
+    ${diagnostics.map(d => `<div class="research-diag">
+      <div class="research-diag-symbol">${esc(d.symbol)}</div>
+      <div><div class="research-diag-label">Funding</div><div class="research-diag-value">${fmtPct(d.fundingRate)}</div></div>
+      <div><div class="research-diag-label">Trend Vol</div><div class="research-diag-value">${fmtRatio(d.trendVolume)}</div></div>
+      <div><div class="research-diag-label">Spike</div><div class="research-diag-value">${fmtRatio(d.spikeVolume)} / ${fmtRatio(d.rangeAtr)} ATR</div></div>
+      <div><div class="research-diag-label">Breakout Gap</div><div class="research-diag-value">${esc(d.breakout)}</div></div>
+    </div>`).join('')}
+  `;
 }
 
 async function refresh() {
