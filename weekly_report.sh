@@ -161,6 +161,69 @@ echo "  V2 Funding Mean-Reversion: regime-silent (funding at baseline)"
 echo "  V4 Cascade Dip-Buy: data-blocked at N=4"
 echo "  Graveyard: 9 families killed (L01-L30)"
 echo "  Active edge: none — waiting for regime change or new hypothesis"
+python3 <<'PY' 2>/dev/null
+import datetime as dt
+import os
+import sqlite3
+
+trades = 'data/trades.db'
+conditions = 'data/condition_log.db'
+last_iso = '1970-01-01T00:00:00'
+
+if os.path.exists(trades):
+    conn = sqlite3.connect(trades)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        'SELECT timestamp, signal, entry_price, exit_price, pnl_usd '
+        'FROM trades ORDER BY timestamp DESC LIMIT 1'
+    ).fetchone()
+    open_count = conn.execute(
+        'SELECT COUNT(*) FROM trades WHERE exit_price IS NULL'
+    ).fetchone()[0]
+    conn.close()
+    if row:
+        last = dt.datetime.strptime(row['timestamp'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=dt.timezone.utc)
+        last_iso = row['timestamp'].replace(' ', 'T')
+        days = (dt.datetime.now(dt.timezone.utc) - last).total_seconds() / 86400
+        timestamp = row['timestamp']
+        signal = row['signal']
+        entry_price = row['entry_price']
+        print(f'  Last trade: {timestamp} UTC ({days:.1f} days ago), {signal} at {entry_price:,.1f}')
+        print(f'  Trade log open rows: {open_count}')
+
+if os.path.exists(conditions):
+    conn = sqlite3.connect(conditions)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """
+        SELECT condition_name,
+               COUNT(*) AS checks,
+               SUM(passed) AS passes,
+               ROUND(100.0 * SUM(passed) / COUNT(*), 2) AS pass_rate,
+               MAX(current_value) AS max_value,
+               AVG(threshold) AS avg_threshold
+        FROM condition_log
+        WHERE timestamp >= ?
+        GROUP BY condition_name
+        ORDER BY pass_rate ASC, condition_name
+        LIMIT 1
+        """
+    , (last_iso,)).fetchone()
+    conn.close()
+    if row:
+        condition_name = row['condition_name']
+        passes = row['passes']
+        checks = row['checks']
+        pass_rate = row['pass_rate']
+        max_value = row['max_value']
+        avg_threshold = row['avg_threshold']
+        print(
+            f'  Main blocker since last trade: {condition_name} '
+            f'passed {passes}/{checks} checks '
+            f'({pass_rate:.2f}%). '
+            f'Max value {max_value:.6f}, threshold {avg_threshold:.6f}.'
+        )
+PY
 
 # Git status
 echo ""
