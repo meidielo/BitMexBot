@@ -40,7 +40,7 @@ jobs:
           python -m pip install pytest
 
       - name: Run risk and research safety tests
-        run: python -m unittest test_logger test_risk test_research_scanner test_live_readiness -v
+        run: python -m unittest test_logger test_risk test_research_scanner test_live_readiness test_dependency_audit_runner -v
 
       - name: Run signal tests
         run: python -m pytest test_signals.py -v

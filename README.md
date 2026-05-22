@@ -94,6 +94,7 @@ main.py              V2 15-minute loop orchestrator
 | `audit.py` | Trade-log audit + summary statistics |
 | `research_scanner.py` | Read-only multi-symbol shadow scanner; writes watch-only candidate signals to `data/research_signals.db` |
 | `live_readiness.py` | Read-only live-readiness and no-go gate evaluator; never enables live trading |
+| `tools/dependency_audit_runner.py` | Controlled dependency audit runner; writes pip-audit, KEV, ledger, and diagnostics artifacts |
 | `weekly_report.sh` | Weekly project status (cron, every Monday 09:00) |
 
 ## Research / Shadow Mode
@@ -128,7 +129,7 @@ This script does not switch the bot to live trading. It only reports whether the
 ## Tests
 
 ```bash
-python -m unittest test_logger test_risk test_research_scanner test_live_readiness -v
+python -m unittest test_logger test_risk test_research_scanner test_live_readiness test_dependency_audit_runner -v
 python -m pytest test_signals.py -v
 ```
 

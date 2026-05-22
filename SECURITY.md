@@ -25,3 +25,25 @@ Priority mapping:
 
 The ledger artifact is the record of why a finding was treated as urgent or
 routine for that run.
+
+## Audit Runner Reliability
+
+The weekly workflow uses `tools/dependency_audit_runner.py` instead of ad-hoc
+shell steps. The runner creates a temporary audit virtual environment, installs
+`pip-audit` with retries, runs `pip-audit`, downloads the CISA KEV catalog,
+builds the triage ledger, and keeps the raw evidence as CI artifacts.
+
+Artifacts retained by the workflow include:
+
+- `audit-runner-diagnostics.json` and `.md`: Python, platform, requirements
+  hash, and relevant environment hints.
+- `pip-audit-install-attempt-*`: install stdout, stderr, exit code, and timing.
+- `pip-audit.json`, `pip-audit.stderr.txt`, and `pip-audit.status.json`.
+- `known_exploited_vulnerabilities.json` and `kev-download.log`.
+- `security-triage-ledger.md` and `security-triage-summary.json`.
+- `audit-runner-summary.json`: pass/fail status plus actionable diagnostics.
+
+If package index access, KEV download, or `pip-audit` JSON generation fails, the
+job fails with the artifact set above. The expected response is to inspect the
+diagnostic files and rerun in a network-permitted environment, not to change
+trading strategy, order execution, risk limits, or testnet guards.

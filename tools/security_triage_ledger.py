@@ -19,7 +19,7 @@ def _load_json(path: Path) -> dict[str, Any]:
         with path.open("r", encoding="utf-8-sig") as handle:
             data = json.load(handle)
     except FileNotFoundError:
-        return {}
+        raise SystemExit(f"Required JSON file is missing: {path}") from None
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
 

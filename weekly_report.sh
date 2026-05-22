@@ -146,7 +146,7 @@ echo ""
 echo "## Codebase Health"
 UNIT_LOG=$(mktemp)
 PYTEST_LOG=$(mktemp)
-python -m unittest test_logger test_risk test_research_scanner test_live_readiness -v >"$UNIT_LOG" 2>&1
+python -m unittest test_logger test_risk test_research_scanner test_live_readiness test_dependency_audit_runner -v >"$UNIT_LOG" 2>&1
 UNIT_STATUS=$?
 python -m pytest test_signals.py -q >"$PYTEST_LOG" 2>&1
 PYTEST_STATUS=$?
