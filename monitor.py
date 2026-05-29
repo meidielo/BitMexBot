@@ -10,11 +10,13 @@ import sqlite3
 from datetime import datetime, timezone
 
 from logger import DB_PATH, _connect, _init_db
+import sys
 
 # Single source of truth for the daily loss limit lives in risk.py
 try:
     from risk import MAX_DAILY_LOSS_USD
 except ImportError:
+    print("Handled exception in monitor.py:17", file=sys.stderr)
     MAX_DAILY_LOSS_USD = 50.0
 
 

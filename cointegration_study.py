@@ -38,6 +38,7 @@ import pandas as pd
 from scipy import stats as sp_stats
 from statsmodels.tsa.stattools import adfuller, coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
+import sys
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -212,6 +213,7 @@ def test_pair(s1: pd.Series, s2: pd.Series, name1: str, name2: str) -> dict:
         result["eg_pval"] = round(eg_pval, 4)
         result["eg_pass"] = eg_pval < P_THRESHOLD
     except Exception as e:
+        print("Handled exception in cointegration_study.py:214", file=sys.stderr)
         result["eg_error"] = str(e)
         result["eg_pass"] = False
 
@@ -231,6 +233,7 @@ def test_pair(s1: pd.Series, s2: pd.Series, name1: str, name2: str) -> dict:
         result["adf_pval"] = round(adf_pval, 4)
         result["adf_pass"] = adf_pval < P_THRESHOLD
     except Exception as e:
+        print("Handled exception in cointegration_study.py:233", file=sys.stderr)
         result["adf_error"] = str(e)
         result["adf_pass"] = False
 
@@ -244,6 +247,7 @@ def test_pair(s1: pd.Series, s2: pd.Series, name1: str, name2: str) -> dict:
         result["johansen_crit95"] = round(trace_crit_95, 4)
         result["johansen_pass"] = trace_stat > trace_crit_95
     except Exception as e:
+        print("Handled exception in cointegration_study.py:246", file=sys.stderr)
         result["johansen_error"] = str(e)
         result["johansen_pass"] = False
 
@@ -271,6 +275,7 @@ def test_pair(s1: pd.Series, s2: pd.Series, name1: str, name2: str) -> dict:
         result["hurst"] = round(hurst, 4)
         result["hurst_pass"] = hurst < HURST_THRESHOLD
     except Exception:
+        print("Handled exception in cointegration_study.py:273", file=sys.stderr)
         result["hurst"] = np.nan
         result["hurst_pass"] = False
 
@@ -357,6 +362,7 @@ def check_stability(s1: pd.Series, s2: pd.Series,
             _, pval, _ = coint(y, x, trend="c", maxlag=None, autolag="AIC")
             passed = pval < P_THRESHOLD
         except Exception:
+            print("Handled exception in cointegration_study.py:359", file=sys.stderr)
             passed = False
             pval = 1.0
 

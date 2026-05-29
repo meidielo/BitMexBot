@@ -13,11 +13,13 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+import sys
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
+    print("Handled exception in live_readiness.py:20", file=sys.stderr)
     pass
 
 
@@ -44,6 +46,7 @@ def _parse_dt(value: str | None) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
+        print("Handled exception in live_readiness.py:46", file=sys.stderr)
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -66,6 +69,7 @@ def _scalar(conn: sqlite3.Connection, query: str, params: tuple[Any, ...] = (), 
     try:
         row = conn.execute(query, params).fetchone()
     except sqlite3.Error:
+        print("Handled exception in live_readiness.py:68", file=sys.stderr)
         return default
     if not row or row[0] is None:
         return default
@@ -151,6 +155,7 @@ def _trade_metrics(trade_db_path: str, read_only: bool) -> dict[str, Any]:
         finally:
             conn.close()
     except sqlite3.Error as exc:
+        print("Handled exception in live_readiness.py:153", file=sys.stderr)
         metrics["error"] = type(exc).__name__
     return metrics
 
@@ -217,6 +222,7 @@ def _research_metrics(research_db_path: str, read_only: bool, now: datetime) -> 
         finally:
             conn.close()
     except sqlite3.Error as exc:
+        print("Handled exception in live_readiness.py:219", file=sys.stderr)
         metrics["error"] = type(exc).__name__
     return metrics
 

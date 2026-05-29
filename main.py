@@ -29,6 +29,7 @@ from risk           import validate_signal
 from order_manager  import execute_signal
 from logger         import log_trade, update_trade_exit
 from monitor        import print_summary
+import sys
 
 load_dotenv()
 
@@ -233,6 +234,7 @@ def main() -> None:
                     body_threshold=0.0005,
                 )
             except Exception:
+                print("Handled exception in main.py:235", file=sys.stderr)
                 pass  # telemetry must never break the trading loop
 
             # ----------------------------------------------------------
@@ -300,6 +302,7 @@ def main() -> None:
                 _sleep_to_next_bar(loop_start)
 
     except KeyboardInterrupt:
+        print("Handled exception in main.py:302", file=sys.stderr)
         _shutdown()
 
 

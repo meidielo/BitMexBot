@@ -101,12 +101,15 @@ def _get(endpoint: str, params: dict) -> list | dict | None:
             _log(f"[ERROR] {endpoint}: HTTP {r.status_code} — {r.text[:200]}")
             return None
         except requests.exceptions.Timeout:
+            print("Handled exception in binance_data_fetcher.py:103", file=sys.stderr)
             _log(f"[TIMEOUT] attempt {attempt+1}/{MAX_RETRIES}")
             time.sleep(5)
         except requests.exceptions.ConnectionError as e:
+            print("Handled exception in binance_data_fetcher.py:106", file=sys.stderr)
             _log(f"[CONN_ERROR] attempt {attempt+1}/{MAX_RETRIES}: {e}")
             time.sleep(10)
         except Exception as e:
+            print("Handled exception in binance_data_fetcher.py:109", file=sys.stderr)
             _log(f"[ERROR] {endpoint}: {e}")
             return None
 

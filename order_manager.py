@@ -15,6 +15,7 @@ import os
 import time
 from dotenv import load_dotenv
 from bitmex_client import get_client
+import sys
 
 load_dotenv()
 
@@ -261,11 +262,13 @@ def execute_signal(signal: dict, validated_risk: dict) -> dict:
     try:
         exchange = get_client()
     except Exception as e:
+        print("Handled exception in order_manager.py:263", file=sys.stderr)
         return _result("failed", error=f"Failed to connect to exchange: {e}")
 
     try:
         exchange.set_leverage(LEVERAGE, SYMBOL)
     except Exception:
+        print("Handled exception in order_manager.py:268", file=sys.stderr)
         # BitMEX multi-asset accounts use cross margin and do not support
         # per-symbol isolated leverage — this call may fail on those accounts.
         pass
@@ -284,6 +287,7 @@ def execute_signal(signal: dict, validated_risk: dict) -> dict:
                     ),
                 )
     except Exception:
+        print("Handled exception in order_manager.py:286", file=sys.stderr)
         # If we can't verify, proceed cautiously — set_leverage was attempted
         pass
 
@@ -315,12 +319,14 @@ def execute_signal(signal: dict, validated_risk: dict) -> dict:
             f"  Size: {amount} contracts"
         )
     except Exception as e:
+        print("Handled exception in order_manager.py:317", file=sys.stderr)
         return _result("failed", error=f"Entry order placement failed: {e}")
 
     # Market orders fill immediately — fetch the final order state.
     try:
         filled_order = exchange.fetch_order(entry_order["id"], SYMBOL)
     except Exception:
+        print("Handled exception in order_manager.py:323", file=sys.stderr)
         filled_order = entry_order
 
     if filled_order.get("status") not in ("closed", None):

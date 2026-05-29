@@ -20,10 +20,12 @@ import time as _time
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, render_template_string
+import sys
 
 try:
     from live_readiness import evaluate_live_readiness
 except ImportError:
+    print("Handled exception in dashboard.py:26", file=sys.stderr)
     evaluate_live_readiness = None
 
 # ---------------------------------------------------------------------------
@@ -38,6 +40,7 @@ MAX_DAILY_LOSS_USD = 50.0
 try:
     from risk import MAX_DAILY_LOSS_USD
 except ImportError:
+    print("Handled exception in dashboard.py:40", file=sys.stderr)
     pass
 
 LOG_TAIL   = 120
@@ -63,6 +66,7 @@ def _query(sql: str, params: tuple = ()) -> list:
             conn.close()
         return [dict(r) for r in rows]
     except Exception:
+        print("Handled exception in dashboard.py:65", file=sys.stderr)
         return []
 
 
@@ -74,6 +78,7 @@ def _log_tail() -> list:
             lines = fh.readlines()
         return [ln.rstrip() for ln in lines[-LOG_TAIL:]]
     except Exception as e:
+        print("Handled exception in dashboard.py:76", file=sys.stderr)
         return [f"[Error reading log: {e}]"]
 
 
@@ -95,6 +100,7 @@ def _parse_latest_diagnostics() -> dict:
         with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
     except Exception:
+        print("Handled exception in dashboard.py:97", file=sys.stderr)
         return diag
 
     # Find the last loop start
@@ -158,6 +164,7 @@ def _research_row(row: sqlite3.Row) -> dict:
     try:
         metadata = json.loads(raw)
     except json.JSONDecodeError:
+        print("Handled exception in dashboard.py:160", file=sys.stderr)
         metadata = {}
     item["metadata"] = metadata if isinstance(metadata, dict) else {}
     return item
@@ -249,6 +256,7 @@ def _research_snapshot() -> dict:
             "latest_signals": [_research_row(row) for row in latest_signals],
         }
     except Exception as exc:
+        print("Handled exception in dashboard.py:251", file=sys.stderr)
         return {**empty, "status": f"Shadow scanner read error: {type(exc).__name__}"}
 
 
@@ -271,6 +279,7 @@ def _readiness_snapshot() -> dict:
             read_only=True,
         )
     except Exception as exc:
+        print("Handled exception in dashboard.py:273", file=sys.stderr)
         return {
             "verdict": "UNAVAILABLE",
             "headline": f"Readiness evaluator error: {type(exc).__name__}",
@@ -307,6 +316,7 @@ def _collect() -> dict:
             if d.get("date") == today:
                 daily_loss_usd = float(d["loss_usd"])
         except Exception:
+            print("Handled exception in dashboard.py:309", file=sys.stderr)
             pass
     daily_loss_pct = min(daily_loss_usd / MAX_DAILY_LOSS_USD * 100, 100.0)
     halted = daily_loss_usd >= MAX_DAILY_LOSS_USD
@@ -891,6 +901,7 @@ if __name__ == "__main__":
         ).strip()
         bind_host = ts_ip
     except Exception:
+        print("Handled exception in dashboard.py:893", file=sys.stderr)
         pass
 
     print(f"Dashboard running at http://{bind_host}:{DASH_PORT}")

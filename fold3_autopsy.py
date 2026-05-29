@@ -16,6 +16,7 @@ Hypotheses to test (pre-registered, do not add after seeing data):
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import sys
 
 FOLD3_START = "2025-01-02"
 FOLD3_END   = "2026-04-03"
@@ -41,6 +42,7 @@ if 'vol_z_entry' not in trades.columns:
         try:
             return daily.loc[d, col]
         except KeyError:
+            print("Handled exception in fold3_autopsy.py:43", file=sys.stderr)
             return np.nan
     trades['vol_z_entry'] = trades['entry_date'].apply(lambda d: _lookup(d, 'vol_z'))
 if 'atr' not in trades.columns:
@@ -74,6 +76,7 @@ def days_to_next_spike(entry_date, daily_df, window=5, threshold=2.0):
     try:
         future = daily_df.loc[entry_date:].iloc[1:window+1]
     except KeyError:
+        print("Handled exception in fold3_autopsy.py:76", file=sys.stderr)
         return 0
     spikes = future[future['vol_z'] >= threshold]
     return len(spikes)
@@ -98,6 +101,7 @@ def get_atr_ratio(entry_date, daily_df):
     try:
         return daily_df.loc[entry_date, 'atr_ratio']
     except KeyError:
+        print("Handled exception in fold3_autopsy.py:100", file=sys.stderr)
         return np.nan
 
 f3_loss['atr_ratio'] = f3_loss['entry_date'].apply(

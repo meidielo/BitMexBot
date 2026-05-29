@@ -18,6 +18,7 @@ from typing import Any
 
 import ccxt
 import pandas as pd
+import sys
 
 
 DEFAULT_SYMBOLS = [
@@ -58,6 +59,7 @@ def _number(value: Any, default: float = 0.0) -> float:
     try:
         result = float(value)
     except (TypeError, ValueError):
+        print("Handled exception in research_scanner.py:60", file=sys.stderr)
         return default
     if pd.isna(result):
         return default
@@ -318,6 +320,7 @@ def fetch_funding(exchange: ccxt.Exchange, symbol: str) -> tuple[float | None, d
     try:
         payload = exchange.fetch_funding_rate(symbol)
     except Exception as exc:
+        print("Handled exception in research_scanner.py:320", file=sys.stderr)
         return None, {"error": type(exc).__name__}
 
     rate = payload.get("fundingRate")
@@ -482,6 +485,7 @@ def scan_once(
             candles = fetch_candles(exchange, symbol, limit)
             funding_rate, funding_metadata = fetch_funding(exchange, symbol)
         except Exception as exc:
+            print("Handled exception in research_scanner.py:484", file=sys.stderr)
             errors.append({"symbol": symbol, "error": type(exc).__name__, "detail": str(exc)})
             continue
 

@@ -94,7 +94,7 @@ main.py              V2 15-minute loop orchestrator
 | `audit.py` | Trade-log audit + summary statistics |
 | `research_scanner.py` | Read-only multi-symbol shadow scanner; writes watch-only candidate signals to `data/research_signals.db` |
 | `live_readiness.py` | Read-only live-readiness and no-go gate evaluator; never enables live trading |
-| `tools/dependency_audit_runner.py` | Controlled dependency audit runner; writes pip-audit, KEV, ledger, and diagnostics artifacts |
+| `tools/dependency_audit_runner.py` | Controlled dependency audit runner; writes pip-audit, KEV, EPSS/watchlist, ledger, and diagnostics artifacts |
 | `weekly_report.sh` | Weekly project status (cron, every Monday 09:00) |
 
 ## Research / Shadow Mode

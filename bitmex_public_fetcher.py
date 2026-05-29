@@ -131,6 +131,7 @@ def _download_day(d: date) -> pd.DataFrame | None:
                 df = pd.read_csv(f)
             return df
         except Exception:
+            print("Handled exception in bitmex_public_fetcher.py:133", file=sys.stderr)
             os.remove(cache_path)  # corrupted cache, re-download
 
     for attempt in range(MAX_RETRIES):
@@ -156,12 +157,15 @@ def _download_day(d: date) -> pd.DataFrame | None:
             return None
 
         except requests.exceptions.Timeout:
+            print("Handled exception in bitmex_public_fetcher.py:158", file=sys.stderr)
             _log(f"[TIMEOUT] {date_str} attempt {attempt+1}/{MAX_RETRIES}")
             time.sleep(RETRY_SLEEP)
         except requests.exceptions.ConnectionError as e:
+            print("Handled exception in bitmex_public_fetcher.py:161", file=sys.stderr)
             _log(f"[CONN_ERROR] {date_str} attempt {attempt+1}/{MAX_RETRIES}: {e}")
             time.sleep(RETRY_SLEEP)
         except Exception as e:
+            print("Handled exception in bitmex_public_fetcher.py:164", file=sys.stderr)
             _log(f"[ERROR] {date_str}: {e}")
             return None
 
@@ -309,6 +313,7 @@ def fetch_range(conn: sqlite3.Connection, start: date, end: date,
                      f"{total_rows:,} records, {skipped} skipped")
 
         except Exception as e:
+            print("Handled exception in bitmex_public_fetcher.py:311", file=sys.stderr)
             conn.execute(
                 "INSERT OR REPLACE INTO fetch_log VALUES (?, ?, ?, ?)",
                 (date_str, "ERROR", 0, str(e)[:500])

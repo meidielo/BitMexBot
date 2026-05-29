@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import venv
 from dataclasses import dataclass
@@ -29,9 +30,11 @@ DEFAULT_KEV_URL = (
     "https://www.cisa.gov/sites/default/files/feeds/"
     "known_exploited_vulnerabilities.json"
 )
+DEFAULT_EPSS_URL = "https://api.first.org/data/v1/epss"
 DEFAULT_OUTPUT_DIR = Path("security-triage")
 PIP_AUDIT_JSON_NAME = "pip-audit.json"
 KEV_JSON_NAME = "known_exploited_vulnerabilities.json"
+EPSS_JSON_NAME = "epss.json"
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,7 @@ def download_with_retries(
     attempts: int,
     timeout_s: int,
     log_path: Path,
+    label: str = "KEV download",
 ) -> bool:
     lines: list[str] = []
     for attempt in range(1, attempts + 1):
@@ -162,7 +166,7 @@ def download_with_retries(
             message = f"attempt {attempt}: {type(exc).__name__}: {exc} after {elapsed}s"
             lines.append(message)
             log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            print(f"KEV download {message}", file=sys.stderr)
+            print(f"{label} {message}", file=sys.stderr)
             if attempt < attempts:
                 time.sleep(min(2 * attempt, 6))
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -173,6 +177,59 @@ def load_json_file(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8-sig") as handle:
         data = json.load(handle)
     return data if isinstance(data, dict) else {}
+
+
+def extract_cves_from_pip_audit(path: Path) -> list[str]:
+    payload = load_json_file(path)
+    cves: set[str] = set()
+    for dependency in payload.get("dependencies") or []:
+        if not isinstance(dependency, dict):
+            continue
+        for vuln in dependency.get("vulns") or dependency.get("vulnerabilities") or []:
+            if not isinstance(vuln, dict):
+                continue
+            ids = [vuln.get("id"), vuln.get("vulnerability_id"), *(vuln.get("aliases") or [])]
+            for item in ids:
+                text = str(item or "").upper()
+                if text.startswith("CVE-"):
+                    cves.add(text)
+    return sorted(cves)
+
+
+def download_epss_for_cves(
+    cves: list[str],
+    url: str,
+    output_path: Path,
+    attempts: int,
+    timeout_s: int,
+    log_path: Path,
+) -> bool:
+    if not cves:
+        output_path.write_text(
+            json.dumps(
+                {
+                    "status": "not_requested",
+                    "reason": "pip-audit findings did not include CVE aliases",
+                    "data": [],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        log_path.write_text("not requested: no CVE aliases\n", encoding="utf-8")
+        return True
+
+    query = urllib.parse.urlencode({"cve": ",".join(cves)})
+    endpoint = f"{url}?{query}"
+    return download_with_retries(
+        endpoint,
+        output_path,
+        attempts=attempts,
+        timeout_s=timeout_s,
+        log_path=log_path,
+        label="FIRST EPSS lookup",
+    )
 
 
 def diagnostic_payload(repo_root: Path, output_dir: Path, requirements: Path) -> dict[str, Any]:
@@ -337,6 +394,24 @@ def run_audit(args: argparse.Namespace) -> int:
         (output_dir / "audit-runner-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         return 13
 
+    epss_json = output_dir / EPSS_JSON_NAME
+    epss_ok = download_epss_for_cves(
+        extract_cves_from_pip_audit(pip_json),
+        args.epss_url,
+        epss_json,
+        attempts=args.attempts,
+        timeout_s=args.download_timeout,
+        log_path=output_dir / "epss-download.log",
+    )
+    if not epss_ok:
+        actionable.append(
+            "FIRST EPSS lookup failed. Check epss-download.log and retry from "
+            "a network-permitted environment."
+        )
+        summary = make_summary("failed", pip_state, pip_audit.returncode, None, actionable)
+        (output_dir / "audit-runner-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        return 14
+
     ledger_summary_path = output_dir / "security-triage-summary.json"
     ledger = run_command(
         [
@@ -346,11 +421,14 @@ def run_audit(args: argparse.Namespace) -> int:
             str(pip_json),
             "--kev-json",
             str(kev_json),
+            "--epss-json",
+            str(epss_json),
             "--output",
             str(output_dir / "security-triage-ledger.md"),
             "--summary-json",
             str(ledger_summary_path),
             *(["--fail-on-kev"] if args.fail_on_kev else []),
+            *(["--fail-on-watchlist"] if args.fail_on_watchlist else []),
         ],
         cwd=repo_root,
         timeout_s=args.ledger_timeout,
@@ -361,6 +439,8 @@ def run_audit(args: argparse.Namespace) -> int:
     if ledger.returncode != 0:
         if ledger.returncode == 2:
             actionable.append("KEV-matched dependency finding requires immediate triage.")
+        elif ledger.returncode == 4:
+            actionable.append("Non-KEV watchlist dependency finding requires explicit triage.")
         else:
             actionable.append("Security triage ledger generation failed; check security-triage-ledger.stderr.txt.")
         summary = make_summary("failed", pip_state, pip_audit.returncode, ledger_summary, actionable)
@@ -372,7 +452,8 @@ def run_audit(args: argparse.Namespace) -> int:
     print(
         f"Dependency audit passed. pip-audit={pip_state}, "
         f"findings={ledger_summary.get('total_findings', 'unknown')}, "
-        f"kev={ledger_summary.get('kev_findings', 'unknown')}"
+        f"kev={ledger_summary.get('kev_findings', 'unknown')}, "
+        f"watchlist={ledger_summary.get('watchlist_findings', 'unknown')}"
     )
     return 0
 
@@ -383,12 +464,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--requirements", default="requirements.txt")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--kev-url", default=DEFAULT_KEV_URL)
+    parser.add_argument("--epss-url", default=DEFAULT_EPSS_URL)
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--install-timeout", type=int, default=180)
     parser.add_argument("--audit-timeout", type=int, default=240)
     parser.add_argument("--download-timeout", type=int, default=45)
     parser.add_argument("--ledger-timeout", type=int, default=60)
     parser.add_argument("--fail-on-kev", action="store_true")
+    parser.add_argument("--fail-on-watchlist", action="store_true")
     parser.add_argument("--clean", action="store_true")
     return parser
 

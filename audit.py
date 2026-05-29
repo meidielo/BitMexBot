@@ -16,6 +16,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
+import sys
 
 load_dotenv()
 
@@ -55,6 +56,7 @@ def _rows(sql: str, params: tuple = ()) -> list:
         conn.close()
         return result
     except Exception:
+        print("Handled exception in audit.py:57", file=sys.stderr)
         return []
 
 
@@ -293,6 +295,7 @@ def chk_no_hardcoded_keys() -> tuple[bool, str]:
                             f"    {fname}:{lineno}:  {line.strip()[:72]}"
                         )
         except Exception as e:
+            print("Handled exception in audit.py:295", file=sys.stderr)
             violations.append(f"    Could not read {fname}: {e}")
 
     passed = len(violations) == 0
@@ -307,8 +310,10 @@ def chk_testnet_guard_present() -> tuple[bool, str]:
     try:
         content = open(path, encoding="utf-8").read()
     except FileNotFoundError:
+        print("Handled exception in audit.py:309", file=sys.stderr)
         return False, f"{path} not found"
     except Exception as e:
+        print("Handled exception in audit.py:311", file=sys.stderr)
         return False, f"Could not read {path}: {e}"
 
     has_fn    = "_assert_testnet" in content
@@ -336,6 +341,7 @@ def chk_db_readable() -> tuple[bool, str]:
         size_kb = os.path.getsize(DB_PATH) / 1024
         return True, f"{DB_PATH} exists and is readable  ({size_kb:.1f} KB)"
     except Exception as e:
+        print("Handled exception in audit.py:338", file=sys.stderr)
         return False, f"{DB_PATH} exists but query failed: {e}"
 
 
@@ -352,6 +358,7 @@ def chk_daily_loss_json_readable() -> tuple[bool, str]:
             f"(date: {d}, loss_usd: ${loss})"
         )
     except Exception as e:
+        print("Handled exception in audit.py:354", file=sys.stderr)
         return False, f"{DAILY_LOSS_FILE} exists but could not be parsed: {e}"
 
 
@@ -477,6 +484,7 @@ def run_audit() -> None:
             try:
                 passed, detail = fn()
             except Exception as e:
+                print("Handled exception in audit.py:479", file=sys.stderr)
                 passed, detail = False, f"Check raised an exception: {e}"
             _print_check(label, passed, detail)
             all_results.append((label, passed, detail))

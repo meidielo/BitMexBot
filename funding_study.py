@@ -28,6 +28,7 @@ import os
 import numpy as np
 import pandas as pd
 from scipy import stats
+import sys
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -127,6 +128,7 @@ def build_events(df_fund, df_5m):
             try:
                 prices[m] = close_lookup.at[candle_start]
             except KeyError:
+                print("Handled exception in funding_study.py:129", file=sys.stderr)
                 valid = False
                 break
 
