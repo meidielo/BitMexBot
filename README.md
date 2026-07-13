@@ -1,146 +1,188 @@
 # BitMexBot
 
-A BitMEX testnet trading bot built as a learning project. Python 3.12, ccxt, pandas.
+BitMexBot is a Python 3.12 research and execution-safety project for the
+BitMEX XBTUSDT perpetual. Authenticated order execution is hard-limited to
+BitMEX Testnet.
 
-## What It Does
+> **Current verdict: DO NOT USE REAL FUNDS.** The repository now has a safer
+> execution foundation, but it has no authenticated mainnet client and no
+> evidence package that clears the promotion gates.
 
-Runs a 15-minute loop: fetch candles from mainnet (public data) -> evaluate V2 Funding Rate Mean-Reversion signal -> validate risk -> execute orders on testnet -> log to SQLite + condition telemetry.
+## What is implemented
 
-The live bot remains testnet-only. New strategy ideas should first go through read-only shadow tracking in `research_scanner.py`, which records watch-only candidate signals without importing the order manager, risk layer, API keys, or execution code.
+- Completed-candle decisions only. A 15-minute signal is identified by its
+  exact candle close and cannot be replayed on restart. Every accepted parent
+  has exactly three aligned, completed 5-minute children, and the completed
+  15-minute sequence must be contiguous.
+- Causal live inputs. The runner excludes forming 5-minute/15-minute candles
+  and uses only funding observations settled by the decision timestamp.
+- Exact execution-endpoint attestation. Before private operations, the client
+  rechecks `BITMEX_TESTNET=true`, exchange ID `bitmex`, and exact public and
+  private API origins of `https://testnet.bitmex.com`. The separate mainnet
+  data client is unauthenticated and has no order credentials.
+- Runtime instrument verification. Startup rejects anything other than the
+  active, linear, USDT-settled XBTUSDT swap and verifies contract size, lot
+  size, tick size, fees, and margin metadata.
+- Strict position verification. A private position query must return exactly
+  one XBTUSDT record, and CCXT's contracts/side fields must agree with native
+  BitMEX `currentQty`, `isOpen`, symbol, and OneWay mode. Before a new entry,
+  an account-wide inventory must also show no other exposure or resting order.
+  The operating boundary is a dedicated account with no manual trading.
+- Correct XBTUSDT units. At the metadata observed on 2026-07-13, one contract
+  represents `0.000001 BTC`, the order lot is 100 contracts, and the tick is
+  `0.1 USDT`. The bot validates these values at runtime instead of trusting the
+  documentation.
+- Cost-buffered stop-distance sizing. Risk is expressed separately as
+  contracts, BTC, notional USDT, raw stop loss, and expected loss including a
+  10 bps entry-slippage buffer, 20 bps stop-slippage buffer, and round-trip
+  taker fees. Current realized daily loss plus the proposed buffered loss may
+  not exceed the daily cap. Missing state vetoes the order.
+- Bounded entry execution. Entries are marketable IOC limit orders capped at
+  10 basis points of top-of-book slippage.
+- Idempotent order submission. Stable UUIDv5 client order IDs plus pre/post
+  reconciliation prevent blind retries after network timeouts. Malformed
+  create responses are reconciled; a returned order with a missing or wrong
+  client ID is retained, canceled by exchange order ID, and manually halted.
+- IOC terminal-state handling. Every visible nonterminal entry is canceled and
+  proven terminal, including zero-fill and partial-fill responses. Only the
+  proven filled quantity receives protective orders. If the expected client ID
+  is invisible, every safety poll still inventories account-wide orders and
+  positions; unattributed XBTUSDT exposure is closed and manually halted.
+- Fill-anchored protection. Stop and target distances are recomputed from the
+  actual average entry fill and rounded conservatively to the verified tick.
+  Both orders share a deterministic native OCO link, and their returned
+  `clOrdLinkID` and `OneCancelsTheOther` contingency are verified. An untrusted
+  protective leg is canceled to a proven terminal state; after target cleanup,
+  the stop and position are re-attested or the position is closed and halted.
+- Durable lifecycle ledger. `data/trades_v2.db` records intent before
+  submission and uses atomic state transitions. Unknown execution state stops
+  automation and requires reconciliation.
+- Single-intent authority. A non-blocking thread/OS file lock prevents two
+  local runners from entering private execution together, while a SQLite
+  uniqueness constraint allows only one unresolved durable intent.
+- Restart reconciliation. Before evaluating a new signal, the runner repairs
+  or re-verifies the one unresolved intent. It will not trade around unknown
+  entry exposure or unproven protection. Unresolved and managed states are
+  checked every five seconds rather than waiting for the next signal candle.
+- Legacy evidence quarantine. `data/trades.db` mixed BTC and contract units,
+  has application writes disabled, and is excluded from all readiness claims.
+  The file itself is not made filesystem read-only.
+- Fail-closed promotion gate. Automation can reach at most
+  `CANARY_REVIEW`; it cannot enable production trading.
 
-## Current Strategy Status
+## What is not implemented
 
-| Strategy | File | Status |
-|----------|------|--------|
-| V2 Funding Rate Mean-Reversion | `signals.py` | Live on `main.py`. Last entry 2026-04-10. Funding gate has been below threshold for 14+ days; designed to fire ~0× / 6mo in current regime (see `tasks/lessons.md` L30). |
+- No authenticated mainnet exchange constructor or live-order switch.
+- No proven strategy edge. The funding strategy is historically
+  regime-dependent and currently treated as an experimental hypothesis.
+- No complete, automated exit, fee, and funding reconciliation suitable for
+  unattended continuation after a protected position closes. If restart finds
+  a protected intent flat, it enters manual halt because post-exit sibling
+  cancellation verification, fill, fee, funding, and realized-PnL accounting
+  are not automated end to end.
+- No independent WebSocket watchdog, operator paging path, or tested host
+  failover.
+- No completed promotion evidence: costed out-of-sample research, shadow
+  duration, lifecycle drills, and mainnet dry-run evidence are absent locally.
 
-Nine strategy families systematically tested and killed (V1–V4 indicator/cascade variants, S1–S4 multi-strategy, pairs/stat-arb, cross-sectional momentum, funding-settlement arb, vol regime). See `tasks/lessons.md` L01–L30 and the Strategy Graveyard in [`DESIGN.md`](DESIGN.md) for full history.
+See [Real Funds Readiness](docs/REAL_FUNDS_READINESS.md) for the research,
+control matrix, evidence thresholds, and remaining blockers. See
+[Threat Model](docs/THREAT_MODEL.md) for security and operational failure
+scenarios.
 
-## Risk Controls
+## Risk profiles
 
-- 15x fixed leverage (verified after every `set_leverage` call)
-- 2% of balance per trade, max 0.10 BTC
-- Stop-loss on every trade, verified to fire before liquidation price
-- Max 1 open position at a time
-- $50 daily gross loss limit (bot halts for the day)
-- Minimum 1.5:1 reward-to-risk ratio
-- 10% minimum free margin after position open
-- **Testnet only** — enforced in code
+`TESTNET_LIMITS` preserves the engineering profile used for Testnet exercises:
+15x configured leverage, 2% stop-loss budget, 0.10 BTC cap, $50 daily gross-loss
+limit, and 10% minimum free margin.
 
-## What This Project Demonstrates
+`CANARY_REVIEW_LIMITS` is a separate, pre-committed ceiling for a possible
+future human-reviewed canary:
 
-Engineering for autonomous trading infrastructure on a real exchange API — not a profitable strategy. The interesting parts are the loop, the risk gate, the telemetry, and the deployment.
+- 1x leverage
+- 0.1% account risk budget per trade
+- 0.001 BTC and $25 notional caps
+- $5 daily gross-loss limit
+- 50% minimum free margin
 
-- **Decision loop on a real exchange API** — 15-minute scheduling, fetch / evaluate / risk / execute pipeline, ccxt for BitMEX testnet
-- **Risk layer that can veto execution** — six independent rules; every signal that reaches `order_manager.py` has been approved. SL is verified to fire before liquidation price *before* every order
-- **Per-condition telemetry** — every condition checked is logged to SQLite (`condition_log.db`) so post-hoc analysis can show *why* the bot did or didn't trade. Useful for reasoning about silent regimes
-- **Honest documentation of dead branches** — nine strategy families tested and killed; see `tasks/lessons.md` and the Strategy Graveyard in [`DESIGN.md`](DESIGN.md). That file also contains the project's Hard Rules, Audit Protocol, Data Reality notes, and Gate Checklist — the project design doc
-- **Deployment hygiene** — systemd-managed bot + dashboard services, .env-only secrets, testnet enforced in code, no withdraw permission on any API key
+The canary profile is not connected to a production exchange client.
 
-### Trade history
+## Setup
 
-20 autonomous entries placed late March – early April 2026, all risk-approved. 8 closed (5 wins / 3 losses, **+1.41 USDT net** on a ~$700 testnet balance — directional edge was positive over the sample but N is far too small for an inference); the remaining 12 were order-placement failures the system logged and recovered from without crashing. Strategy is correctly silent right now — funding rate has been 5–10× below the entry threshold for 14+ days.
-
-| # | Entry time (UTC) | Side  | Entry  | Exit   | Size (contracts) | PnL (USDT) | Closed by |
-|---|------------------|-------|--------|--------|------------------|------------|-----------|
-| 1 | 2026-04-05 22:33 | LONG  | 67,386 | 67,640 | 188              | +0.7095    | MANUAL    |
-| 2 | 2026-04-06 16:03 | SHORT | 69,867 | 69,890 | 193              | −0.0633    | MANUAL    |
-| 3 | 2026-04-07 15:03 | LONG  | 67,828 | 67,915 | 188              | +0.2395    | MANUAL    |
-| 4 | 2026-04-07 21:18 | SHORT | 69,777 | 69,835 | 193              | −0.1596    | MANUAL    |
-| 5 | 2026-04-08 13:48 | LONG  | 71,867 | 71,942 | 198              | +0.2069    | MANUAL    |
-| 6 | 2026-04-08 17:33 | LONG  | 71,571 | 71,727 | 197              | +0.4299    | MANUAL    |
-| 7 | 2026-04-09 02:03 | SHORT | 70,878 | 70,893 | 196              | −0.0420    | MANUAL    |
-| 8 | 2026-04-10 08:03 | LONG  | 71,463 | 71,496 | 196              | +0.0883    | MANUAL    |
-|   |                  |       |        |        | **Total**        | **+1.4092**|           |
-
-PnL is computed in `logger.compute_pnl_usdt` as `contracts × (exit − entry) / entry` for longs (sign inverted for shorts) — the correct formula for XBTUSDT linear perpetual where 1 contract = 1 USDT notional. "Closed by: MANUAL" means manually closed (the autonomous SL/TP didn't fire); the *entries* are all autonomous and risk-approved.
-
-## Quick Start
-
-```bash
-cd BitMexBot
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Configure
-cp .env.example .env
-# Edit .env with your BitMEX testnet API keys
-
-# Run
-python main.py
+```powershell
+cd "C:\path\to\BitMexBot"
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+Copy-Item .env.example .env
+.\.venv\Scripts\python.exe trade_ledger.py --init
 ```
+
+Create a dedicated BitMEX Testnet key with order permissions and no withdrawal
+permission. Fill in `.env`, then run:
+
+```powershell
+.\.venv\Scripts\python.exe main.py
+```
+
+The authenticated client requires the literal value `BITMEX_TESTNET=true`
+before CCXT is even constructed. Sandbox mode is its first exchange method
+call.
+
+## Verification
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -v
+.\.venv\Scripts\python.exe test_signals.py
+.\.venv\Scripts\python.exe audit.py
+powershell -ExecutionPolicy Bypass -File C:\Users\meidi\.ai-agent-policy\scripts\Invoke-AgentQualityGate.ps1 -Path .
+```
+
+`requirements.txt` contains runtime dependencies. `requirements-dev.txt`
+includes it and pins `pytest`, so pytest is available only after the development
+requirements are installed. The required verification path is unittest
+discovery plus `test_signals.py` and `audit.py` above.
+
+`audit.py` is expected to return nonzero until every local safety, v2 history,
+and promotion-evidence gate passes. Even a zero exit means only that a human
+canary review may begin. It does not authorize live trading.
 
 ## Architecture
 
-```
-main.py              V2 15-minute loop orchestrator
-  |
-  +-- fetch_data.py        5m OHLCV from mainnet, resampled to 15m
-  +-- signals.py           V2: Funding Rate Mean Reversion (single strategy)
-  +-- risk.py              6-rule risk filter (vetoes unsafe signals)
-  +-- order_manager.py     Place orders with SL/TP on testnet
-  +-- logger.py            SQLite trade logging
-  +-- condition_logger.py  Per-condition telemetry every loop
-  +-- monitor.py           Daily summary
-```
-
-## Other Tools
-
-| Script | Purpose |
-|--------|---------|
-| `dashboard.py` | Flask read-only web dashboard (port 5000) |
-| `backtest.py` | V2 funding-rate backtest |
-| `audit.py` | Trade-log audit + summary statistics |
-| `research_scanner.py` | Read-only multi-symbol shadow scanner; writes watch-only candidate signals to `data/research_signals.db` |
-| `live_readiness.py` | Read-only live-readiness and no-go gate evaluator; never enables live trading |
-| `tools/dependency_audit_runner.py` | Controlled dependency audit runner; writes pip-audit, KEV, EPSS/watchlist, ledger, and diagnostics artifacts |
-| `weekly_report.sh` | Weekly project status (cron, every Monday 09:00) |
-
-## Research / Shadow Mode
-
-Use testnet to validate plumbing and operational discipline, not to prove a trading edge. Candidate strategies are trained as shadow observations first:
-
-```bash
-python research_scanner.py --once
-python research_scanner.py --scorecard-only
+```text
+main.py
+  +-- bitmex_client.py       strict Testnet client and metadata verification
+  +-- fetch_data.py          completed public candles and settled funding
+  +-- signals.py             experimental funding mean-reversion hypothesis
+  +-- risk.py                fail-closed unit-aware sizing and limits
+  +-- order_manager.py       IOC entry, idempotency, partial fills, SL and TP
+  +-- execution_lock.py      thread and OS singleton execution authority
+  +-- execution_safety.py    pure decision/order reconciliation primitives
+  +-- trade_ledger.py        durable v2 execution lifecycle
+  +-- daily_loss_state.py    atomic loss state derived from reconciled v2 rows
+  +-- promotion.py           evidence stages, never production enablement
+  +-- audit.py               local safety and real-funds no-go audit
 ```
 
-The scanner currently tracks BitMEX public-data candidates across BTC, ETH, SOL, and XRP USDT swaps:
+## Evidence policy
 
-- `btc_trend_breakout_vol_filter`: 20-bar breakout with EMA200, volatility, and volume filters.
-- `vol_spike_reversion_proxy`: high-volume range shock proxy for possible mean reversion.
-- `funding_extreme_watch`: lower-threshold funding watchlist for squeeze candidates.
+The old claims based on 2026 `data/trades.db` rows are withdrawn. Their mixed
+quantity semantics make the historical PnL values unsuitable for statistical
+or promotion evidence. Testnet also validates plumbing, not profitability.
 
-Outputs are `WATCH_LONG`, `WATCH_SHORT`, or `NO_SIGNAL`. They are not trade orders, and the live testnet guards remain unchanged.
+The current promotion thresholds include 200 independent costed OOS clusters,
+100 untouched clusters, at least three chronological folds with every fold
+acceptable, Deflated Sharpe confidence of at least 0.95, Probability of
+Backtest Overfitting no more than 0.20, 90 shadow days with order authority
+disabled, 100 testnet lifecycle drills with required-scenarios and
+zero-unreconciled-incident booleans true, and a 30-day mainnet dry run with
+zero order authority plus all required dry-run booleans true. These are
+evidence-field gates, not proof that the underlying exercises occurred.
 
-## Live Readiness / No-Go Gate
+## Dependency maintenance
 
-The project has a read-only readiness evaluator:
+The weekly dependency audit remains separate from strategy work. It combines
+`pip-audit` findings with CISA KEV and EPSS/watchlist context. See
+[Security Maintenance](SECURITY.md).
 
-```bash
-python live_readiness.py
-```
-
-It defaults to `NOT_READY` until hard evidence clears every gate: confirmed testnet environment, enough closed testnet trades, positive sample PnL, clean risk approvals, clean position-size audit, daily halt evidence, fresh shadow scanner data, and enough watch candidates. It also keeps no-go rules for deciding when a candidate should not be promoted, such as a negative 30+ trade sample or a long shadow period with almost no watch candidates.
-
-This script does not switch the bot to live trading. It only reports whether the evidence is strong enough for manual review.
-
-## Tests
-
-```bash
-python -m unittest test_logger test_risk test_research_scanner test_live_readiness test_dependency_audit_runner -v
-python -m pytest test_signals.py -v
-```
-
-## Exchange Details
-
-- **Library**: ccxt
-- **Data**: Mainnet public OHLCV (no API key needed)
-- **Execution**: Testnet only (`testnet.bitmex.com`)
-- **Instrument**: XBTUSDT linear perpetual (1 contract = $1 USDT)
-- **Timeframe**: 15-minute candles
-
-## Status
-
-Learning project. Running on testnet. Not financial advice.
+This is experimental software, not financial advice.

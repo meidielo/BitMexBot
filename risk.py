@@ -1,253 +1,347 @@
+"""Fail-closed pre-trade risk validation for the XBTUSDT testnet engine.
+
+Sizing is derived from current exchange instrument metadata and the distance to
+the stop.  Contract counts, BTC exposure, USDT notional, and expected stop loss
+are kept as separate values throughout the decision.
 """
-risk.py — Phase 4
-Validates a signal dict against hardcoded risk rules before any order is placed.
-No exchange connection. No order placement. Pure logic.
-"""
+
+from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_FLOOR
 
-# ---------------------------------------------------------------------------
-# Hardcoded constants — never overridden by signals, config, or AI output
-# ---------------------------------------------------------------------------
-LEVERAGE            = 15          # fixed leverage for every trade
-MAX_POSITION_BTC    = 0.10        # retained for audit.py / test_risk.py reference
-MAX_CONTRACTS       = 1500        # hard cap: ~0.10 BTC at typical prices
-RISK_PER_TRADE_PCT  = 0.02        # 2 % of account balance risked per trade
-MAX_DAILY_LOSS_USD  = 50.0        # bot halts for the day if this is hit
-MIN_FREE_MARGIN_PCT = 0.10        # 10% — minimum free margin after position open
+from instrument import XBTUSDTInstrument
 
-# Liquidation buffer: liq is estimated at 90 % of the theoretical margin level.
-# Formula:
-#   LONG  liq = entry * (1 - (1/leverage) * LIQ_BUFFER)
-#   SHORT liq = entry * (1 + (1/leverage) * LIQ_BUFFER)
+
+LEVERAGE = 15
+MAX_POSITION_BTC = 0.10
+RISK_PER_TRADE_PCT = 0.02
+MAX_DAILY_LOSS_USD = 50.0
+MIN_FREE_MARGIN_PCT = 0.10
 LIQ_BUFFER = 0.9
-
+MIN_ENTRY_SLIPPAGE_BPS = Decimal("10")
+MIN_STOP_SLIPPAGE_BPS = Decimal("20")
 DAILY_LOSS_FILE = os.path.join("data", "daily_loss.json")
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class RiskLimits:
+    leverage: int = LEVERAGE
+    risk_per_trade_fraction: Decimal = Decimal("0.02")
+    max_position_btc: Decimal = Decimal("0.10")
+    max_notional_usdt: Decimal | None = None
+    max_daily_loss_usdt: Decimal = Decimal("50")
+    minimum_free_margin_fraction: Decimal = Decimal("0.10")
+    entry_slippage_bps: Decimal = MIN_ENTRY_SLIPPAGE_BPS
+    stop_slippage_bps: Decimal = MIN_STOP_SLIPPAGE_BPS
 
-def _load_daily_loss() -> float:
-    """
-    Read today's realised loss (USD) from data/daily_loss.json.
-    Returns 0.0 if the file does not exist or today has no entry.
-    Schema: {"date": "YYYY-MM-DD", "loss_usd": 35.50}
-    """
+    def __post_init__(self) -> None:
+        if self.leverage < 1:
+            raise ValueError("leverage must be at least 1")
+        for name in (
+            "risk_per_trade_fraction",
+            "max_position_btc",
+            "max_daily_loss_usdt",
+            "minimum_free_margin_fraction",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.risk_per_trade_fraction >= 1:
+            raise ValueError("risk_per_trade_fraction must be below 1")
+        if self.minimum_free_margin_fraction >= 1:
+            raise ValueError("minimum_free_margin_fraction must be below 1")
+        if self.max_notional_usdt is not None and self.max_notional_usdt <= 0:
+            raise ValueError("max_notional_usdt must be positive when set")
+        if not 0 <= self.entry_slippage_bps < 10_000:
+            raise ValueError("entry_slippage_bps must be in [0, 10000)")
+        if not 0 <= self.stop_slippage_bps < 10_000:
+            raise ValueError("stop_slippage_bps must be in [0, 10000)")
+
+
+TESTNET_LIMITS = RiskLimits()
+
+# Pre-committed ceiling for a future human-reviewed canary. This profile is
+# deliberately not wired to an authenticated production client, because that
+# client does not exist in this repository.
+CANARY_REVIEW_LIMITS = RiskLimits(
+    leverage=1,
+    risk_per_trade_fraction=Decimal("0.001"),
+    max_position_btc=Decimal("0.001"),
+    max_notional_usdt=Decimal("25"),
+    max_daily_loss_usdt=Decimal("5"),
+    minimum_free_margin_fraction=Decimal("0.50"),
+)
+
+
+def _decimal(value: float | int | Decimal, field: str) -> Decimal:
     try:
-        if not os.path.exists(DAILY_LOSS_FILE):
-            return 0.0
-        with open(DAILY_LOSS_FILE, "r") as f:
-            data = json.load(f)
-        if data.get("date") == datetime.now(timezone.utc).strftime("%Y-%m-%d"):
-            return float(data.get("loss_usd", 0.0))
-        return 0.0  # stale file — different day
-    except Exception as e:
-        print(f"[WARN] Could not read daily loss file: {e}. Assuming $0.")
-        return 0.0
+        parsed = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{field} must be numeric") from exc
+    if not parsed.is_finite():
+        raise ValueError(f"{field} must be finite")
+    return parsed
 
 
-def _calc_liq_price(entry: float, signal: str) -> float:
-    """
-    Estimate liquidation price at fixed leverage with a 10 % buffer.
-    LONG  liq = entry * (1 - (1/leverage) * LIQ_BUFFER)
-    SHORT liq = entry * (1 + (1/leverage) * LIQ_BUFFER)
-    """
-    margin_fraction = (1 / LEVERAGE) * LIQ_BUFFER
+def _load_daily_loss(path: str = DAILY_LOSS_FILE) -> float | None:
+    """Return today's gross realised loss, or ``None`` when state is untrusted."""
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if data.get("date") != today:
+            return None
+        if data.get("source") != "trades_v2.db":
+            return None
+        loss = float(data["loss_usd"])
+        if loss < 0:
+            return None
+        return loss
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):  # agent-quality: allow: None is an explicit fail-closed state
+        return None
+
+
+def _calc_liq_price(entry: float, signal: str, leverage: int = LEVERAGE) -> float:
+    """Conservative pre-fill estimate; exchange liquidation is verified later."""
+
+    margin_fraction = (1 / leverage) * LIQ_BUFFER
     if signal == "LONG":
         return entry * (1 - margin_fraction)
     return entry * (1 + margin_fraction)
 
 
-def _calc_position_size(account_balance: float) -> int:
-    """
-    XBTUSDT is a linear perpetual — size is in contracts, settled in USDT.
-    Formula  : contracts = account_balance * RISK_PER_TRADE_PCT * LEVERAGE
-    Minimum  : 1 contract (no rounding to 100 required for linear).
-    Capped   : at MAX_CONTRACTS (1500).
-    Example  : $578 → 578 * 0.02 * 15 = 173.4 → 173 contracts
-    """
-    raw       = account_balance * RISK_PER_TRADE_PCT * LEVERAGE
-    contracts = max(1, int(raw))
-    return min(contracts, MAX_CONTRACTS)
+def _calc_position_size(
+    account_balance_usdt: float,
+    entry_price_usdt: float,
+    stop_price_usdt: float,
+    instrument: XBTUSDTInstrument,
+    limits: RiskLimits = TESTNET_LIMITS,
+) -> int:
+    """Size from maximum stop loss, then apply BTC/notional caps and lot floor."""
+
+    equity = _decimal(account_balance_usdt, "account_balance_usdt")
+    entry = _decimal(entry_price_usdt, "entry_price_usdt")
+    stop = _decimal(stop_price_usdt, "stop_price_usdt")
+    if equity <= 0 or entry <= 0 or stop <= 0 or entry == stop:
+        return 0
+
+    risk_budget = equity * limits.risk_per_trade_fraction
+    loss_per_contract = _estimated_loss_per_contract(
+        entry,
+        stop,
+        instrument,
+        limits,
+    )
+    if loss_per_contract <= 0:
+        return 0
+    by_stop = (risk_budget / loss_per_contract).to_integral_value(rounding=ROUND_FLOOR)
+    by_btc = (
+        limits.max_position_btc / instrument.contract_size_btc
+    ).to_integral_value(rounding=ROUND_FLOOR)
+    caps = [by_stop, by_btc]
+    if limits.max_notional_usdt is not None:
+        per_contract_notional = instrument.contract_size_btc * entry
+        caps.append(
+            (limits.max_notional_usdt / per_contract_notional).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+        )
+    return instrument.round_down_contracts(min(caps))
+
+
+def _estimated_loss_per_contract(
+    entry_price_usdt: Decimal,
+    stop_price_usdt: Decimal,
+    instrument: XBTUSDTInstrument,
+    limits: RiskLimits,
+) -> Decimal:
+    """Return stop loss plus conservative entry/exit slippage and taker fees."""
+
+    entry_fraction = limits.entry_slippage_bps / Decimal(10_000)
+    stop_fraction = limits.stop_slippage_bps / Decimal(10_000)
+    price_loss = abs(entry_price_usdt - stop_price_usdt)
+    slippage_loss = (
+        entry_price_usdt * entry_fraction
+        + stop_price_usdt * stop_fraction
+    )
+    round_trip_fees = (
+        entry_price_usdt + stop_price_usdt
+    ) * instrument.taker_fee_rate
+    return instrument.contract_size_btc * (
+        price_loss + slippage_loss + round_trip_fees
+    )
 
 
 def _veto(reason: str) -> dict:
-    return {"approved": False, "reason": reason,
-            "position_size_btc": None, "leverage": None}
+    return {
+        "approved": False,
+        "reason": reason,
+        "position_size_contracts": None,
+        "position_size_btc": None,
+        "notional_usdt": None,
+        "expected_max_loss_usdt": None,
+        "raw_stop_loss_usdt": None,
+        "estimated_costs_usdt": None,
+        "entry_slippage_bps": None,
+        "stop_slippage_bps": None,
+        "taker_fee_rate": None,
+        "leverage": None,
+    }
 
 
-def _approve(reason: str, position_size_btc: int) -> dict:
-    return {"approved": True, "reason": reason,
-            "position_size_btc": int(position_size_btc),
-            "leverage": LEVERAGE}
+def validate_signal(
+    signal: dict,
+    account_balance: float,
+    open_positions: list,
+    *,
+    instrument: XBTUSDTInstrument,
+    free_balance_usdt: float | None = None,
+    limits: RiskLimits = TESTNET_LIMITS,
+    daily_loss_usdt: float | None = None,
+) -> dict:
+    """Apply every risk rule and return an approval bound to explicit units."""
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def validate_signal(signal: dict, account_balance: float,
-                    open_positions: list) -> dict:
-    """
-    Apply every hardcoded risk rule to a signal.
-
-    Parameters
-    ----------
-    signal          : dict returned by signals.get_signal()
-    account_balance : current free balance in USD
-    open_positions  : list of currently open positions (empty = no open trade)
-
-    Returns
-    -------
-    dict with keys: approved, reason, position_size_btc, leverage
-    """
-
-    # ------------------------------------------------------------------
-    # Rule 1 — Signal must be LONG or SHORT
-    # ------------------------------------------------------------------
     sig = signal.get("signal")
     if sig not in ("LONG", "SHORT"):
         return _veto(
-            f"Rule 1 FAILED: signal is '{sig}'. "
-            "Only LONG or SHORT may proceed to risk check."
+            f"Rule 1 FAILED: signal is '{sig}'. Only LONG or SHORT may proceed."
         )
+    try:
+        entry = float(signal["entry_price"])
+        stop = float(signal["sl_price"])
+        target = float(signal["tp_price"])
+    except (KeyError, TypeError, ValueError):  # agent-quality: allow: malformed signal is returned as an explicit veto
+        return _veto("Rule 1 FAILED: entry, stop, and target must be numeric.")
+    if min(entry, stop, target) <= 0:
+        return _veto("Rule 1 FAILED: entry, stop, and target must be positive.")
+    if sig == "LONG" and not (stop < entry < target):
+        return _veto("Rule 1 FAILED: LONG requires stop < entry < target.")
+    if sig == "SHORT" and not (target < entry < stop):
+        return _veto("Rule 1 FAILED: SHORT requires target < entry < stop.")
 
-    entry    = signal.get("entry_price")
-    sl_price = signal.get("sl_price")
-
-    # Guard: entry and sl must be present (they always are for LONG/SHORT,
-    # but we verify defensively)
-    if entry is None or sl_price is None:
-        return _veto("Rule 1 FAILED: entry_price or sl_price is None on a directional signal.")
-
-    # ------------------------------------------------------------------
-    # Rule 2 — Only one trade at a time
-    # ------------------------------------------------------------------
     if open_positions:
         return _veto(
-            f"Rule 2 FAILED: {len(open_positions)} open position(s) already exist. "
-            "Bot trades one position at a time."
+            f"Rule 2 FAILED: {len(open_positions)} open position(s) already exist."
         )
 
-    # ------------------------------------------------------------------
-    # Rule 3 — Daily loss must be under the hard limit
-    # ------------------------------------------------------------------
-    daily_loss = _load_daily_loss()
-    if daily_loss >= MAX_DAILY_LOSS_USD:
+    loss_today = _load_daily_loss() if daily_loss_usdt is None else daily_loss_usdt
+    if loss_today is None:
+        return _veto("Rule 3 FAILED: daily loss state is missing, stale, or corrupt.")
+    try:
+        loss_today_dec = _decimal(loss_today, "daily_loss_usdt")
+    except ValueError as exc:  # agent-quality: allow: conversion failure is returned as an explicit veto
+        return _veto(f"Rule 3 FAILED: {exc}.")
+    if loss_today_dec < 0:
+        return _veto("Rule 3 FAILED: daily loss cannot be negative.")
+    if loss_today_dec >= limits.max_daily_loss_usdt:
         return _veto(
-            f"Rule 3 FAILED: daily loss ${daily_loss:.2f} has reached the "
-            f"${MAX_DAILY_LOSS_USD:.2f} limit. Bot is halted for the day."
+            f"Rule 3 FAILED: daily loss ${loss_today_dec:.2f} reached the "
+            f"${limits.max_daily_loss_usdt:.2f} limit."
         )
 
-    # ------------------------------------------------------------------
-    # Rule 4 — SL must fire before the estimated liquidation price
-    #
-    #   LONG : price falls  → liq is BELOW entry, SL also below entry
-    #          SL is safe if sl_price > liq_price  (SL hit first on way down)
-    #
-    #   SHORT: price rises  → liq is ABOVE entry, SL also above entry
-    #          SL is safe if sl_price < liq_price  (SL hit first on way up)
-    # ------------------------------------------------------------------
-    liq_price = _calc_liq_price(entry, sig)
-
-    if sig == "LONG" and sl_price <= liq_price:
+    liq_price = _calc_liq_price(entry, sig, limits.leverage)
+    if sig == "LONG" and stop <= liq_price:
         return _veto(
-            f"Rule 4 FAILED (LONG): SL {sl_price:.2f} is at or below estimated "
-            f"liquidation price {liq_price:.2f}. "
-            "Liquidation would occur before stop-loss fires."
+            f"Rule 4 FAILED: LONG stop {stop:.2f} is not above estimated "
+            f"liquidation {liq_price:.2f}."
         )
-
-    if sig == "SHORT" and sl_price >= liq_price:
+    if sig == "SHORT" and stop >= liq_price:
         return _veto(
-            f"Rule 4 FAILED (SHORT): SL {sl_price:.2f} is at or above estimated "
-            f"liquidation price {liq_price:.2f}. "
-            "Liquidation would occur before stop-loss fires."
+            f"Rule 4 FAILED: SHORT stop {stop:.2f} is not below estimated "
+            f"liquidation {liq_price:.2f}."
         )
 
-    # ------------------------------------------------------------------
-    # Rule 5 — Position sizing (2 % risk, hard cap 1500 contracts)
-    # ------------------------------------------------------------------
-    position_size_btc = _calc_position_size(account_balance)
-    capped = position_size_btc >= MAX_CONTRACTS
-
-    # ------------------------------------------------------------------
-    # Rule 6 — Minimum free margin (10% of account balance)
-    #
-    # After opening the position, at least 10% of balance must remain
-    # as free margin.  Margin used ≈ notional / leverage.
-    # XBTUSDT linear: 1 contract = $1 USDT notional.
-    # So: notional = contracts (in USD), margin = contracts / leverage.
-    # ------------------------------------------------------------------
-    margin_used    = position_size_btc / LEVERAGE
-    free_after     = account_balance - margin_used
-    free_pct       = free_after / account_balance if account_balance > 0 else 0
-
-    if free_pct < MIN_FREE_MARGIN_PCT:
-        return _veto(
-            f"Rule 6 FAILED: free margin after trade would be "
-            f"${free_after:.2f} ({free_pct:.1%} of ${account_balance:.2f}). "
-            f"Minimum is {MIN_FREE_MARGIN_PCT:.0%}."
-        )
-
-    # ------------------------------------------------------------------
-    # All rules passed — build approval message
-    # ------------------------------------------------------------------
-    reason_parts = [
-        f"All risk rules passed for {sig}.",
-        f"Entry: {entry:.2f}  |  SL: {sl_price:.2f}  |  Liq (est.): {liq_price:.2f}",
-        f"Position size: {position_size_btc} contracts"
-        + (" (capped at 1500 max)" if capped else
-           f"  ({account_balance:.2f} * 2% * {LEVERAGE}x, truncated to integer)"),
-        f"Leverage: {LEVERAGE}x  |  Daily loss so far: ${daily_loss:.2f}",
-    ]
-
-    return _approve(" | ".join(reason_parts), position_size_btc)
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point — runs against live testnet data for a quick sanity check
-# ---------------------------------------------------------------------------
-def _print_result(result: dict) -> None:
-    verdict = "  APPROVED  " if result["approved"] else "  VETOED    "
-    width = 62
-    print("=" * width)
-    print(f"  RISK FILTER: [{verdict}]")
-    print("=" * width)
-    print(f"  {result['reason']}")
-    if result["approved"]:
-        print(f"  Position size : {result['position_size_btc']} contracts")
-        print(f"  Leverage      : {result['leverage']}x")
-    print("=" * width)
-
-
-if __name__ == "__main__":
-    from fetch_data import fetch_ohlcv, fetch_current_funding, fetch_recent_funding
-    from signals import get_signal
-
-    print("Phase 4 — Risk filter check on live testnet signal\n")
-
-    df = fetch_ohlcv()
-    if df is None:
-        raise SystemExit("[ABORT] Could not fetch OHLCV data.")
-
-    funding = fetch_current_funding()
-    recent = fetch_recent_funding(count=10)
-    funding_data = None
-    if funding and funding.get("rate") is not None:
-        cum_24h = recent["rate"].tail(3).sum() if not recent.empty else 0
-        funding_data = {"rate": funding["rate"], "funding_24h": cum_24h}
-
-    sig = get_signal(df, current_funding=funding_data)
-    print(f"Signal received: {sig['signal']}  |  {sig['reason']}\n")
-
-    # Use a dummy balance of $1,000 and no open positions for the demo
-    result = validate_signal(
-        signal=sig,
-        account_balance=1000.0,
-        open_positions=[],
+    contracts = _calc_position_size(
+        account_balance, entry, stop, instrument, limits
     )
-    _print_result(result)
+    if contracts < instrument.lot_size_contracts:
+        return _veto(
+            "Rule 5 FAILED: risk budget is below the exchange minimum lot size."
+        )
+
+    base_btc = instrument.contracts_to_btc(contracts)
+    notional = instrument.notional_usdt(contracts, entry)
+    raw_stop_loss = base_btc * Decimal(str(abs(entry - stop)))
+    expected_loss = Decimal(contracts) * _estimated_loss_per_contract(
+        Decimal(str(entry)),
+        Decimal(str(stop)),
+        instrument,
+        limits,
+    )
+    estimated_costs = expected_loss - raw_stop_loss
+    risk_budget = Decimal(str(account_balance)) * limits.risk_per_trade_fraction
+    if loss_today_dec + expected_loss > limits.max_daily_loss_usdt:
+        remaining_daily_budget = limits.max_daily_loss_usdt - loss_today_dec
+        return _veto(
+            "Rule 3 FAILED: buffered expected loss "
+            f"${expected_loss:.2f} exceeds the remaining daily loss budget "
+            f"${remaining_daily_budget:.2f}."
+        )
+    if expected_loss > risk_budget:
+        return _veto("Rule 5 FAILED: rounded position exceeds the stop-loss budget.")
+    if base_btc > limits.max_position_btc:
+        return _veto("Rule 5 FAILED: rounded position exceeds the BTC exposure cap.")
+    if limits.max_notional_usdt is not None and notional > limits.max_notional_usdt:
+        return _veto("Rule 5 FAILED: rounded position exceeds the USDT notional cap.")
+
+    free_balance = account_balance if free_balance_usdt is None else free_balance_usdt
+    try:
+        free = _decimal(free_balance, "free_balance_usdt")
+        equity = _decimal(account_balance, "account_balance")
+    except ValueError as exc:  # agent-quality: allow: conversion failure is returned as an explicit veto
+        return _veto(f"Rule 6 FAILED: {exc}.")
+    if equity <= 0 or free < 0:
+        return _veto("Rule 6 FAILED: account equity/free balance is invalid.")
+    margin_required = notional / Decimal(limits.leverage)
+    free_after = free - margin_required
+    free_fraction = free_after / equity
+    if free_fraction < limits.minimum_free_margin_fraction:
+        return _veto(
+            f"Rule 6 FAILED: free margin after trade would be ${free_after:.2f} "
+            f"({free_fraction:.1%}); minimum is "
+            f"{limits.minimum_free_margin_fraction:.0%}."
+        )
+
+    return {
+        "approved": True,
+        "reason": (
+            f"All risk rules passed for {sig}; {contracts} contracts, "
+            f"{base_btc:.6f} BTC, ${notional:.2f} notional, "
+            f"${expected_loss:.2f} expected loss including cost buffers."
+        ),
+        "position_size_contracts": contracts,
+        "position_size_btc": float(base_btc),
+        "notional_usdt": float(notional),
+        "expected_max_loss_usdt": float(expected_loss),
+        "raw_stop_loss_usdt": float(raw_stop_loss),
+        "estimated_costs_usdt": float(estimated_costs),
+        "entry_slippage_bps": float(limits.entry_slippage_bps),
+        "stop_slippage_bps": float(limits.stop_slippage_bps),
+        "taker_fee_rate": float(instrument.taker_fee_rate),
+        "leverage": limits.leverage,
+    }
+
+
+__all__ = [
+    "DAILY_LOSS_FILE",
+    "CANARY_REVIEW_LIMITS",
+    "LEVERAGE",
+    "LIQ_BUFFER",
+    "MAX_DAILY_LOSS_USD",
+    "MAX_POSITION_BTC",
+    "MIN_FREE_MARGIN_PCT",
+    "MIN_ENTRY_SLIPPAGE_BPS",
+    "MIN_STOP_SLIPPAGE_BPS",
+    "RISK_PER_TRADE_PCT",
+    "RiskLimits",
+    "TESTNET_LIMITS",
+    "_calc_liq_price",
+    "_calc_position_size",
+    "_estimated_loss_per_contract",
+    "_load_daily_loss",
+    "validate_signal",
+]

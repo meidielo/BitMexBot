@@ -86,38 +86,99 @@ def fetch_ohlcv(exchange=None):
         return None
 
     try:
-        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df = df.set_index("timestamp")
-
-        # Fix OHLC consistency: BitMEX API has tick-level artifacts where
-        # H < O or L > C by small amounts (0.001-0.02% of price).
-        # Clamp H/L to include O and C rather than dropping candles.
-        # Dropping was discarding 30% of live data — a 32% data loss rate.
-        df["high"] = df[["high", "open", "close"]].max(axis=1)
-        df["low"]  = df[["low", "open", "close"]].min(axis=1)
-
-        # Only drop truly broken candles (H < L after clamping, or zero/negative prices)
-        bad = (df["high"] < df["low"]) | (df["close"] <= 0)
-        n_bad = int(bad.sum())
-        if n_bad > 0:
-            print(f"[WARN] Dropped {n_bad} truly broken 5m candle(s).")
-            df = df[~bad]
-
-        if df.empty:
-            print("[ERROR] All 5m candles failed sanity check.")
-            return None
-
-        resampled = df.resample(TARGET_TF).agg({
-            "open": "first", "high": "max", "low": "min",
-            "close": "last", "volume": "sum",
-        }).dropna()
-
-        return resampled.tail(LIMIT)
-
+        return _completed_live_candles(raw).tail(LIMIT)
     except Exception as e:
         print(f"[ERROR] Failed to resample candles to 15m: {e}")
         return None
+
+
+def _completed_live_candles(raw, *, now=None):
+    """Return only fully formed 15-minute candles from 5-minute rows.
+
+    BitMEX can return the currently forming 5-minute candle. A parent candle is
+    accepted only when all three aligned child candles have themselves
+    completed. This prevents decisions from mutable, unfinished market data.
+    """
+
+    if not raw:
+        raise ValueError("raw OHLCV is empty")
+
+    now_utc = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.tz_localize("UTC")
+    else:
+        now_utc = now_utc.tz_convert("UTC")
+
+    df = pd.DataFrame(
+        raw,
+        columns=["timestamp", "open", "high", "low", "close", "volume"],
+    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.set_index("timestamp").sort_index()
+    if df.index.has_duplicates:
+        raise ValueError("duplicate 5m candle timestamps")
+
+    aligned = (
+        (df.index.minute % 5 == 0)
+        & (df.index.second == 0)
+        & (df.index.microsecond == 0)
+    )
+    if not bool(aligned.all()):
+        raise ValueError("5m candle timestamp is not aligned")
+
+    child_interval = pd.Timedelta(minutes=5)
+    df = df[(df.index + child_interval) <= now_utc]
+    if df.empty:
+        raise ValueError("no completed 5m candles")
+
+    numeric_columns = ["open", "high", "low", "close", "volume"]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    if df[numeric_columns].isna().any().any():
+        raise ValueError("5m candle contains non-numeric values")
+    if (df[["open", "high", "low", "close"]] <= 0).any().any():
+        raise ValueError("5m candle contains a non-positive price")
+    if (df["volume"] < 0).any():
+        raise ValueError("5m candle contains negative volume")
+
+    df["high"] = df[["high", "open", "close"]].max(axis=1)
+    df["low"] = df[["low", "open", "close"]].min(axis=1)
+    if (df["high"] < df["low"]).any():
+        raise ValueError("5m candle high is below its low")
+
+    child_counts = df["close"].resample(TARGET_TF).count()
+    resampled = df.resample(TARGET_TF).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    })
+    parent_interval = pd.Timedelta(minutes=15)
+    eligible_counts = child_counts[
+        (child_counts.index + parent_interval) <= now_utc
+    ]
+    if eligible_counts.empty:
+        raise ValueError("no complete 15m candles")
+    if (eligible_counts != 3).any():
+        missing = ", ".join(
+            timestamp.isoformat()
+            for timestamp in eligible_counts[eligible_counts != 3].index
+        )
+        raise ValueError(
+            "completed 15m candle sequence has missing children at " + missing
+        )
+
+    completed_index = eligible_counts.index
+    if len(completed_index) > 1:
+        parent_steps = completed_index[1:] - completed_index[:-1]
+        if not bool((parent_steps == parent_interval).all()):
+            raise ValueError("completed 15m candle sequence is not contiguous")
+
+    resampled = resampled.loc[completed_index].dropna()
+    if resampled.empty:
+        raise ValueError("no complete 15m candles")
+    return resampled
 
 
 # ---------------------------------------------------------------------------
