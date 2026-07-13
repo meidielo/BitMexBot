@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import main
+from runtime_status import RuntimeStatusError
 from main import (
     RunnerSafetyError,
     _decision_key,
@@ -207,6 +208,23 @@ class RunOnceKillSwitchTests(unittest.TestCase):
 
 
 class RunnerLoopTests(unittest.TestCase):
+    def test_runtime_heartbeat_persistence_failure_is_nonfatal(self):
+        with (
+            patch.object(
+                main,
+                "write_runner_status",
+                side_effect=RuntimeStatusError("OSError"),
+            ) as writer,
+            patch("builtins.print") as warning,
+        ):
+            main._publish_runtime_status("PAUSED", "safety_reconciliation")
+
+        writer.assert_called_once_with(
+            "PAUSED",
+            detail_code="safety_reconciliation",
+        )
+        warning.assert_called_once()
+
     def test_reconciling_state_rechecks_before_any_bar_sleep(self):
         outcomes = [
             {"status": "reconciling", "reason": "entry not visible"},
@@ -218,6 +236,7 @@ class RunnerLoopTests(unittest.TestCase):
             patch.object(main, "run_once", side_effect=outcomes) as run,
             patch.object(main, "_sleep_to_safety_check") as safety_sleep,
             patch.object(main, "_sleep_to_next_bar") as bar_sleep,
+            patch.object(main, "_publish_runtime_status") as heartbeat,
         ):
             with self.assertRaises(SystemExit):
                 main.main()
@@ -225,6 +244,7 @@ class RunnerLoopTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         safety_sleep.assert_called_once()
         bar_sleep.assert_not_called()
+        self.assertGreaterEqual(heartbeat.call_count, 4)
 
     def test_failed_execution_halts_without_sleep(self):
         with (
@@ -237,12 +257,14 @@ class RunnerLoopTests(unittest.TestCase):
             ),
             patch.object(main, "_sleep_to_safety_check") as safety_sleep,
             patch.object(main, "_sleep_to_next_bar") as bar_sleep,
+            patch.object(main, "_publish_runtime_status") as heartbeat,
         ):
             with self.assertRaises(SystemExit):
                 main.main()
 
         safety_sleep.assert_not_called()
         bar_sleep.assert_not_called()
+        heartbeat.assert_any_call("FAILED", "failed")
 
 
 if __name__ == "__main__":

@@ -3,10 +3,11 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
 from daily_loss_state import DailyLossStateError, refresh_daily_loss_from_ledger
-from trade_ledger import register_intent, transition_intent
+from trade_ledger import close_intent_from_events, register_intent, transition_intent
 
 
 def intent(key="decision-1"):
@@ -42,7 +43,8 @@ class DailyLossStateTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def close_losing_trade(self):
+    def close_losing_trade(self, *, exit_time_utc: str | None = None):
+        exit_time_utc = exit_time_utc or datetime.now(timezone.utc).isoformat()
         register_intent(intent(), self.db)
         transition_intent(
             "decision-1", "ENTRY_PENDING", expected_statuses={"REGISTERED"}, db_path=self.db
@@ -72,19 +74,47 @@ class DailyLossStateTests(unittest.TestCase):
             updates={"target_order_id": "target-order"},
             db_path=self.db,
         )
-        transition_intent(
+        close_intent_from_events(
             "decision-1",
-            "CLOSED",
             expected_statuses={"PROTECTED"},
-            updates={
-                "closed_contracts": 1000,
-                "actual_exit_price_usdt": 90,
-                "gross_pnl_usdt": -0.01,
-                "fees_usdt": 0.001,
-                "funding_usdt": 0,
-                "net_pnl_usdt": -0.011,
-                "exit_reason": "SL",
-            },
+            events=(
+                {
+                    "exec_id": "entry-exec",
+                    "account_id": "account-1",
+                    "native_symbol": "XBTUSDT",
+                    "event_type": "TRADE",
+                    "event_role": "ENTRY",
+                    "order_id": "entry-order",
+                    "client_order_id": "entry-decision-1",
+                    "link_id": None,
+                    "side": "BUY",
+                    "last_qty": 1000,
+                    "last_price_usdt": 100,
+                    "commission_usdt": 0.0005,
+                    "funding_usdt": 0,
+                    "realised_pnl_usdt": -0.0005,
+                    "transact_time_utc": "2026-07-13T00:01:00+00:00",
+                    "source_hash": "a" * 64,
+                },
+                {
+                    "exec_id": "exit-exec",
+                    "account_id": "account-1",
+                    "native_symbol": "XBTUSDT",
+                    "event_type": "TRADE",
+                    "event_role": "EXIT",
+                    "order_id": "target-order",
+                    "client_order_id": "target-decision-1",
+                    "link_id": None,
+                    "side": "SELL",
+                    "last_qty": 1000,
+                    "last_price_usdt": 90,
+                    "commission_usdt": 0.0005,
+                    "funding_usdt": 0,
+                    "realised_pnl_usdt": -0.0105,
+                    "transact_time_utc": exit_time_utc,
+                    "source_hash": "b" * 64,
+                },
+            ),
             db_path=self.db,
         )
 
@@ -100,6 +130,18 @@ class DailyLossStateTests(unittest.TestCase):
         stored = json.loads(Path(self.output).read_text(encoding="utf-8"))
         self.assertEqual(stored["source"], "trades_v2.db")
         self.assertAlmostEqual(stored["loss_usd"], 0.011)
+
+    def test_loss_uses_exchange_exit_date_not_reconciliation_date(self):
+        self.close_losing_trade(exit_time_utc="2026-07-13T13:00:00+00:00")
+
+        payload = refresh_daily_loss_from_ledger(
+            db_path=self.db,
+            output_path=self.output,
+            now=datetime(2026, 7, 14, 0, 1, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(payload["date"], "2026-07-14")
+        self.assertEqual(payload["loss_usd"], 0)
 
     def test_unresolved_intent_blocks_publication(self):
         register_intent(intent(), self.db)
@@ -127,6 +169,21 @@ class DailyLossStateTests(unittest.TestCase):
             connection.commit()
 
         with self.assertRaisesRegex(DailyLossStateError, "invalid ledger"):
+            refresh_daily_loss_from_ledger(
+                db_path=self.db,
+                output_path=self.output,
+            )
+
+    def test_tampered_terminal_evidence_blocks_publication(self):
+        self.close_losing_trade()
+        with closing(sqlite3.connect(self.db)) as connection:
+            connection.execute(
+                "UPDATE execution_intents SET evidence_source_hash = ?",
+                ("0" * 64,),
+            )
+            connection.commit()
+
+        with self.assertRaisesRegex(DailyLossStateError, "evidence hash"):
             refresh_daily_loss_from_ledger(
                 db_path=self.db,
                 output_path=self.output,

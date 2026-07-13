@@ -46,6 +46,18 @@ promotion controls are documented in
   filesystem read-only.
 - A promotion result can never enable production. `CANARY_REVIEW` requires a
   separate human decision and separately controlled deployment mechanism.
+- A protected flat intent may close automatically only after both durable
+  protective legs are proven terminal, the account is re-proven flat with no
+  open orders, and stable paginated native Testnet execution history exactly
+  reconciles quantities, identifiers, account, sides, timestamps, fees,
+  funding, the combined evidence hash, and native `realisedPnl` against
+  independently calculated net PnL. Otherwise it enters a manual halt.
+- The independent WebSocket watchdog has no order, cancellation, dead-man
+  switch, or mainnet capability. Its authenticated upgrade refuses redirects
+  before custom auth headers can reach a second origin. Its output never
+  authorizes execution.
+- The dashboard image receives only the sanitized snapshot volume. It must not
+  receive exchange credentials, the ledger, logs, repository, or Docker socket.
 
 ## Restart and Reconciliation Boundary
 
@@ -53,12 +65,18 @@ On startup and before each new decision, the runner examines the v2 ledger for
 one unresolved intent. Ambiguous entry states are reconciled by deterministic
 client order ID, entry exposure without proven protection is conservatively
 closed when possible, and existing stop/target protection is re-verified. A
-protected intent that is now flat enters `HALTED_MANUAL`. Automated sibling
-OCO placement is implemented, but post-exit sibling-cancellation verification,
-final fill attribution, fees, funding, exit reason, and realized PnL are not
-complete, so unattended continuation after an exit is not claimed. While an
-intent is unresolved or a position is managed, REST reconciliation runs on a
-five-second safety cadence instead of waiting for the next 15-minute candle.
+protected intent that is now flat is closed only from stable native execution
+history after sibling terminal proof and account-wide flat/open-order checks.
+Normalized events are append-only and the close transition is atomic. Missing
+rows, mixed accounts, wrong IDs or sides, quantity mismatches, unattributed
+lifetime trades, inconsistent fees or funding, unstable history, or an
+unproven sibling cause `HALTED_MANUAL`. While an intent is unresolved or a
+position is managed, REST reconciliation runs on a five-second safety cadence
+instead of waiting for the next 15-minute candle. The separate WebSocket
+  watchdog improves detection but does not replace these REST execution proofs.
+  Filled terminal rows require complete exchange provenance, and both the daily
+  loss publisher and readiness evaluator recompute immutable event accounting
+  and evidence hashes before trusting a row.
 
 Promotion evidence is also only a typed, thresholded input. The evaluator
 requires all OOS folds to be acceptable and explicit booleans for disabled
@@ -69,6 +87,13 @@ provenance behind those booleans and never enables production.
 This repo keeps dependency/security work separate from trading strategy work.
 Security maintenance must not change order execution, risk limits, testnet
 guards, backtest parameters, or signal logic.
+
+The remote deployment adds a strict application-local DNS-over-TLS resolver
+because the current host's ISP DNS path returned a hostname-mismatched
+interception certificate for BitMEX. Plaintext DNS fallback and disabled TLS
+verification are forbidden. The dashboard binds to remote loopback and is
+published only through private Tailscale Serve HTTPS. See
+[`docs/REMOTE_DEPLOYMENT.md`](docs/REMOTE_DEPLOYMENT.md).
 
 ## Dependency Triage
 

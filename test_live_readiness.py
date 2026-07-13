@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from live_readiness import evaluate_live_readiness
-from trade_ledger import UNIT_MODEL, register_intent, transition_intent
+from trade_ledger import (
+    UNIT_MODEL,
+    close_intent_from_events,
+    register_intent,
+    transition_intent,
+)
 
 
 def promotion_evidence() -> dict:
@@ -70,7 +75,12 @@ def valid_intent(decision_key: str = "v2|XBTUSDT|2026-07-13T12:45:00Z|LONG") -> 
     }
 
 
-def add_closed_intent(path: str) -> None:
+def add_closed_intent(
+    path: str,
+    *,
+    entry_commission: float = 0.03,
+    exit_commission: float = 0.03,
+) -> None:
     intent = valid_intent()
     register_intent(intent, path)
     transition_intent(
@@ -92,19 +102,47 @@ def add_closed_intent(path: str) -> None:
         },
         db_path=path,
     )
-    transition_intent(
+    close_intent_from_events(
         intent["decision_key"],
-        "CLOSED",
         expected_statuses={"PROTECTED"},
-        updates={
-            "closed_contracts": 1_000,
-            "actual_exit_price_usdt": 63_000,
-            "gross_pnl_usdt": 0.5,
-            "fees_usdt": 0.06,
-            "funding_usdt": 0.0,
-            "net_pnl_usdt": 0.44,
-            "exit_reason": "TARGET",
-        },
+        events=(
+            {
+                "exec_id": "exec-entry-readiness",
+                "account_id": "account-1",
+                "native_symbol": "XBTUSDT",
+                "event_type": "TRADE",
+                "event_role": "ENTRY",
+                "order_id": "entry-1",
+                "client_order_id": intent["entry_client_order_id"],
+                "link_id": None,
+                "side": "BUY",
+                "last_qty": 1_000,
+                "last_price_usdt": 62_500,
+                "commission_usdt": entry_commission,
+                "funding_usdt": 0.0,
+                "realised_pnl_usdt": -entry_commission,
+                "transact_time_utc": "2026-07-13T12:46:00+00:00",
+                "source_hash": "a" * 64,
+            },
+            {
+                "exec_id": "exec-exit-readiness",
+                "account_id": "account-1",
+                "native_symbol": "XBTUSDT",
+                "event_type": "TRADE",
+                "event_role": "EXIT",
+                "order_id": "target-1",
+                "client_order_id": intent["target_client_order_id"],
+                "link_id": None,
+                "side": "SELL",
+                "last_qty": 1_000,
+                "last_price_usdt": 63_000,
+                "commission_usdt": exit_commission,
+                "funding_usdt": 0.0,
+                "realised_pnl_usdt": 0.5 - exit_commission,
+                "transact_time_utc": "2026-07-13T13:00:00+00:00",
+                "source_hash": "b" * 64,
+            },
+        ),
         db_path=path,
     )
 
@@ -209,6 +247,88 @@ class LiveReadinessTests(unittest.TestCase):
 
         self.assertEqual(result["verdict"], "REJECT_DO_NOT_PROMOTE")
         self.assertEqual(result["metrics"]["ledger_v2"]["invalid_accounting_rows"], 1)
+
+    def test_signed_maker_rebate_is_valid_accounting(self):
+        add_closed_intent(
+            self.ledger,
+            entry_commission=-0.01,
+            exit_commission=-0.01,
+        )
+
+        result = self.evaluate()
+
+        self.assertEqual(result["metrics"]["ledger_v2"]["invalid_accounting_rows"], 0)
+        self.assertEqual(result["metrics"]["ledger_v2"]["invalid_evidence_rows"], 0)
+
+    def test_tampered_execution_evidence_hash_rejects_promotion(self):
+        add_closed_intent(self.ledger)
+        with closing(sqlite3.connect(self.ledger)) as connection:
+            connection.execute(
+                "UPDATE execution_intents SET evidence_source_hash = ? "
+                "WHERE status = 'CLOSED'",
+                ("0" * 64,),
+            )
+            connection.commit()
+
+        result = self.evaluate()
+
+        self.assertEqual(result["verdict"], "REJECT_DO_NOT_PROMOTE")
+        self.assertEqual(result["metrics"]["ledger_v2"]["invalid_evidence_rows"], 1)
+
+    def test_unmatched_appended_event_rejects_promotion(self):
+        add_closed_intent(self.ledger)
+        with closing(sqlite3.connect(self.ledger)) as connection:
+            intent_id = connection.execute(
+                "SELECT id FROM execution_intents WHERE status = 'CLOSED'"
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO execution_events ("
+                "intent_id, exec_id, account_id, native_symbol, event_type, event_role, "
+                "order_id, client_order_id, link_id, side, last_qty, last_price_usdt, "
+                "commission_usdt, funding_usdt, realised_pnl_usdt, transact_time_utc, "
+                "source_hash, created_at_utc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    intent_id,
+                    "unmatched-funding",
+                    "account-1",
+                    "XBTUSDT",
+                    "FUNDING",
+                    "FUNDING",
+                    None,
+                    None,
+                    None,
+                    None,
+                    1_000,
+                    None,
+                    0.0,
+                    999.0,
+                    999.0,
+                    "2026-07-13T12:55:00+00:00",
+                    "c" * 64,
+                    "2026-07-13T13:01:00+00:00",
+                ),
+            )
+            connection.commit()
+
+        result = self.evaluate()
+
+        self.assertEqual(result["verdict"], "REJECT_DO_NOT_PROMOTE")
+        self.assertEqual(result["metrics"]["ledger_v2"]["invalid_evidence_rows"], 1)
+
+    def test_old_schema_version_fails_closed(self):
+        add_closed_intent(self.ledger)
+        with closing(sqlite3.connect(self.ledger)) as connection:
+            connection.execute("PRAGMA user_version=3")
+            connection.commit()
+
+        result = self.evaluate()
+
+        self.assertFalse(result["metrics"]["ledger_v2"]["schema_valid"])
+        self.assertEqual(
+            result["metrics"]["ledger_v2"]["error"],
+            "ledger schema version is not current",
+        )
+        self.assertEqual(result["verdict"], "NOT_READY")
 
     def test_unknown_ledger_status_rejects_promotion(self):
         register_intent(valid_intent(), self.ledger)

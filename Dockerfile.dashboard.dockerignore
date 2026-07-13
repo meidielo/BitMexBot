@@ -1,0 +1,5 @@
+# This image receives only its read-only web application and web dependencies.
+*
+!dashboard.py
+!requirements-dashboard.txt
+!Dockerfile.dashboard

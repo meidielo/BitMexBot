@@ -11,11 +11,13 @@ from trade_ledger import (
     DB_PATH,
     LedgerError,
     UNIT_MODEL,
+    close_intent_from_events,
     get_intent,
     get_intent_by_client_order_id,
     get_intent_by_external_order_id,
     initialize_ledger,
     list_active_intents,
+    list_execution_events,
     list_open_intents,
     record_execution_evidence,
     register_intent,
@@ -61,6 +63,38 @@ def distinct_intent(sequence: int) -> dict:
     return values
 
 
+def execution_event(
+    exec_id: str,
+    role: str,
+    order_id: str,
+    side: str,
+    quantity: int,
+    price: float,
+    timestamp: str,
+    source_hash: str,
+    commission: float,
+    realised_pnl: float,
+) -> dict:
+    return {
+        "exec_id": exec_id,
+        "account_id": "42",
+        "native_symbol": "XBTUSDT",
+        "event_type": "TRADE",
+        "event_role": role,
+        "order_id": order_id,
+        "client_order_id": f"{role.lower()}-client",
+        "link_id": None,
+        "side": side,
+        "last_qty": quantity,
+        "last_price_usdt": price,
+        "commission_usdt": commission,
+        "funding_usdt": 0,
+        "realised_pnl_usdt": realised_pnl,
+        "transact_time_utc": timestamp,
+        "source_hash": source_hash,
+    }
+
+
 class TradeLedgerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -68,6 +102,30 @@ class TradeLedgerTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def protect_intent(self) -> str:
+        key = valid_intent()["decision_key"]
+        register_intent(valid_intent(), self.db_path)
+        transition_intent(
+            key,
+            "ENTRY_PENDING",
+            expected_statuses={"REGISTERED"},
+            updates={"entry_order_id": "exchange-entry-1"},
+            db_path=self.db_path,
+        )
+        transition_intent(
+            key,
+            "PROTECTED",
+            expected_statuses={"ENTRY_PENDING"},
+            updates={
+                "filled_contracts": 1_000,
+                "actual_entry_price_usdt": 62_510,
+                "stop_order_id": "exchange-stop-1",
+                "target_order_id": "exchange-target-1",
+            },
+            db_path=self.db_path,
+        )
+        return key
 
     def test_explicit_initialization_allows_fail_closed_reads(self):
         initialized = initialize_ledger(self.db_path)
@@ -146,7 +204,8 @@ class TradeLedgerTests(unittest.TestCase):
         original = register_intent(valid_intent(), self.db_path)
         with closing(sqlite3.connect(self.db_path)) as connection:
             connection.execute("DROP INDEX ux_execution_intents_single_unresolved")
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("DROP TABLE execution_events")
+            connection.execute("PRAGMA user_version = 3")
             connection.commit()
 
         with self.assertRaisesRegex(LedgerError, "schema version"):
@@ -158,6 +217,148 @@ class TradeLedgerTests(unittest.TestCase):
             get_intent(original["decision_key"], self.db_path)["status"],
             "REGISTERED",
         )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            intent_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(execution_intents)"
+                ).fetchall()
+            }
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            triggers = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            }
+        self.assertEqual(version, 4)
+        self.assertTrue(
+            {
+                "entry_time_utc",
+                "exit_time_utc",
+                "reconciled_at_utc",
+                "evidence_source_hash",
+            }
+            <= intent_columns
+        )
+        self.assertIn("execution_events", tables)
+        self.assertEqual(
+            triggers,
+            {
+                "execution_events_append_only_update",
+                "execution_events_append_only_delete",
+            },
+        )
+
+    def test_event_close_is_atomic_append_only_and_restart_idempotent(self):
+        key = self.protect_intent()
+        events = [
+            execution_event(
+                "entry-exec-1",
+                "ENTRY",
+                "exchange-entry-1",
+                "BUY",
+                1_000,
+                62_510,
+                "2026-07-13T13:00:00+00:00",
+                "a" * 64,
+                0.031255,
+                -0.031255,
+            ),
+            execution_event(
+                "exit-exec-1",
+                "EXIT",
+                "exchange-target-1",
+                "SELL",
+                1_000,
+                63_000,
+                "2026-07-13T13:10:00+00:00",
+                "b" * 64,
+                0.0315,
+                0.4585,
+            ),
+        ]
+
+        closed = close_intent_from_events(
+            key,
+            expected_statuses={"PROTECTED"},
+            events=events,
+            db_path=self.db_path,
+        )
+
+        self.assertEqual(closed["status"], "CLOSED")
+        self.assertEqual(closed["exit_reason"], "take_profit")
+        self.assertEqual(closed["entry_time_utc"], "2026-07-13T13:00:00+00:00")
+        self.assertEqual(closed["exit_time_utc"], "2026-07-13T13:10:00+00:00")
+        self.assertIsNotNone(closed["reconciled_at_utc"])
+        self.assertRegex(closed["evidence_source_hash"], r"^[0-9a-f]{64}$")
+        self.assertAlmostEqual(closed["actual_exit_price_usdt"], 63_000)
+        self.assertAlmostEqual(closed["gross_pnl_usdt"], 0.49)
+        self.assertAlmostEqual(closed["fees_usdt"], 0.062755)
+        self.assertAlmostEqual(closed["net_pnl_usdt"], 0.427245)
+        self.assertEqual(len(list_execution_events(key, self.db_path)), 2)
+
+        replayed = close_intent_from_events(
+            key,
+            expected_statuses={"PROTECTED"},
+            events=events,
+            db_path=self.db_path,
+        )
+        self.assertEqual(replayed["id"], closed["id"])
+        self.assertEqual(len(list_execution_events(key, self.db_path)), 2)
+
+        changed = [dict(event) for event in events]
+        changed[0]["source_hash"] = "c" * 64
+        with self.assertRaisesRegex(LedgerError, "different execution evidence"):
+            close_intent_from_events(
+                key,
+                expected_statuses={"PROTECTED"},
+                events=changed,
+                db_path=self.db_path,
+            )
+
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                connection.execute(
+                    "UPDATE execution_events SET source_hash = ?",
+                    ("d" * 64,),
+                )
+            connection.rollback()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                connection.execute("DELETE FROM execution_events")
+            connection.rollback()
+
+    def test_incomplete_event_close_rolls_back_event_and_state_together(self):
+        key = self.protect_intent()
+        entry_only = execution_event(
+            "entry-exec-1",
+            "ENTRY",
+            "exchange-entry-1",
+            "BUY",
+            1_000,
+            62_510,
+            "2026-07-13T13:00:00+00:00",
+            "a" * 64,
+            0.031255,
+            -0.031255,
+        )
+
+        with self.assertRaisesRegex(LedgerError, "filled quantity"):
+            close_intent_from_events(
+                key,
+                expected_statuses={"PROTECTED"},
+                events=[entry_only],
+                db_path=self.db_path,
+            )
+
+        self.assertEqual(get_intent(key, self.db_path)["status"], "PROTECTED")
+        self.assertEqual(list_execution_events(key, self.db_path), [])
 
     def test_missing_ledger_reads_and_mutations_fail_without_creating_it(self):
         missing = str(Path(self.tmp.name) / "absent" / "trades_v2.db")
@@ -417,33 +618,65 @@ class TradeLedgerTests(unittest.TestCase):
                 db_path=self.db_path,
             )
 
-        closed = transition_intent(
-            key,
-            "CLOSED",
-            expected_statuses={"PROTECTED"},
-            updates={
-                "closed_contracts": 1_000,
-                "exit_client_order_id": "bmb-exit-0123456789",
-                "exit_order_id": "exchange-exit-1",
-                "actual_exit_price_usdt": 63_000,
-                "gross_pnl_usdt": 0.49,
-                "fees_usdt": 0.06275,
-                "funding_usdt": -0.01,
-                "net_pnl_usdt": 0.41725,
-                "exit_reason": "take_profit",
-            },
-            db_path=self.db_path,
-        )
-        self.assertEqual(closed["closed_contracts"], 1_000)
-        self.assertEqual(list_open_intents(self.db_path), [])
-        self.assertEqual(
-            get_intent_by_client_order_id("bmb-exit-0123456789", self.db_path)["id"],
-            closed["id"],
-        )
-        self.assertEqual(
-            get_intent_by_external_order_id("exchange-exit-1", self.db_path)["id"],
-            closed["id"],
-        )
+        with self.assertRaisesRegex(LedgerError, "complete exchange provenance"):
+            transition_intent(
+                key,
+                "CLOSED",
+                expected_statuses={"PROTECTED"},
+                updates={
+                    "closed_contracts": 1_000,
+                    "exit_client_order_id": "bmb-exit-0123456789",
+                    "exit_order_id": "exchange-exit-1",
+                    "actual_exit_price_usdt": 63_000,
+                    "gross_pnl_usdt": 0.49,
+                    "fees_usdt": 0.06275,
+                    "funding_usdt": -0.01,
+                    "net_pnl_usdt": 0.41725,
+                    "exit_reason": "take_profit",
+                },
+                db_path=self.db_path,
+            )
+        self.assertEqual(get_intent(key, self.db_path)["status"], "PROTECTED")
+
+    def test_native_realised_pnl_mismatch_rolls_back_close(self):
+        key = self.protect_intent()
+        events = [
+            execution_event(
+                "entry-native-mismatch",
+                "ENTRY",
+                "exchange-entry-1",
+                "BUY",
+                1_000,
+                62_510,
+                "2026-07-13T13:00:00+00:00",
+                "a" * 64,
+                0.031255,
+                -0.031255,
+            ),
+            execution_event(
+                "exit-native-mismatch",
+                "EXIT",
+                "exchange-target-1",
+                "SELL",
+                1_000,
+                63_000,
+                "2026-07-13T13:10:00+00:00",
+                "b" * 64,
+                0.0315,
+                -999,
+            ),
+        ]
+
+        with self.assertRaisesRegex(LedgerError, "native realised PnL"):
+            close_intent_from_events(
+                key,
+                expected_statuses={"PROTECTED"},
+                events=events,
+                db_path=self.db_path,
+            )
+
+        self.assertEqual(get_intent(key, self.db_path)["status"], "PROTECTED")
+        self.assertEqual(list_execution_events(key, self.db_path), [])
 
     def test_halted_manual_remains_visible_for_reconciliation(self):
         key = valid_intent()["decision_key"]

@@ -1,910 +1,640 @@
-"""
-dashboard.py
+"""Read-only WSGI operator dashboard for a sanitized JSON snapshot.
 
-Web dashboard for the BitMEX trading bot.
-Run alongside main.py on the remote PC — reads the same SQLite DB and log file.
-
-    python dashboard.py
-
-Then open from any device on your Tailscale network:
-    http://<tailscale-ip-of-remote-pc>:5000
-
-Requires:  pip install flask
+The public web process deliberately has no database, log, exchange, trading,
+or dotenv imports.  Gunicorn imports ``app`` from this module in production.
 """
 
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
 import json
+import math
 import os
 import re
-import sqlite3
-import time as _time
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+from typing import Any, TypeVar
 
-from flask import Flask, jsonify, render_template_string
-import sys
-
-try:
-    from live_readiness import evaluate_live_readiness
-except ImportError:
-    print("Handled exception in dashboard.py:26", file=sys.stderr)
-    evaluate_live_readiness = None
-
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-DB_PATH    = os.path.join("data", "trades.db")
-LOG_PATH   = os.path.join("logs",  "bot.log")
-DAILY_JSON = os.path.join("data",  "daily_loss.json")
-RESEARCH_DB_PATH = os.path.join("data", "research_signals.db")
-
-MAX_DAILY_LOSS_USD = 50.0
-try:
-    from risk import MAX_DAILY_LOSS_USD
-except ImportError:
-    print("Handled exception in dashboard.py:40", file=sys.stderr)
-    pass
-
-LOG_TAIL   = 120
-DASH_PORT  = 5000
-RESEARCH_CRON_MINUTE = 7
-
-app = Flask(__name__)
+from flask import Flask, Response, current_app, jsonify, render_template_string, request
+from werkzeug.security import check_password_hash
 
 
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
+SNAPSHOT_SCHEMA_VERSION = 1
+DEFAULT_SNAPSHOT_PATH = "data/operator_dashboard/operator_status.json"
+DEFAULT_SNAPSHOT_MAX_AGE_SECONDS = 120
+DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024
 
-def _query(sql: str, params: tuple = ()) -> list:
-    if not os.path.exists(DB_PATH):
-        return []
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(sql, params).fetchall()
-        finally:
-            conn.close()
-        return [dict(r) for r in rows]
-    except Exception:
-        print("Handled exception in dashboard.py:65", file=sys.stderr)
-        return []
-
-
-def _log_tail() -> list:
-    if not os.path.exists(LOG_PATH):
-        return [f"[No log file found at {LOG_PATH}]"]
-    try:
-        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-        return [ln.rstrip() for ln in lines[-LOG_TAIL:]]
-    except Exception as e:
-        print("Handled exception in dashboard.py:76", file=sys.stderr)
-        return [f"[Error reading log: {e}]"]
-
-
-def _parse_latest_diagnostics() -> dict:
-    """Parse the last loop's diagnostics from the log file."""
-    diag = {
-        "candle": {},
-        "signal": "NO_TRADE",
-        "signal_reason": "",
-        "balance": 0,
-        "loop": 0,
-        "loop_time": "",
+_ENVIRONMENTS = frozenset(
+    {"TESTNET", "DRY_RUN", "MIXED_NON_PRODUCTION", "UNKNOWN"}
+)
+_DATA_STATES = frozenset({"OK", "DEGRADED", "UNAVAILABLE"})
+_RUNNER_STATES = frozenset(
+    {
+        "RUNNING",
+        "WAITING",
+        "PAUSED",
+        "MANUAL_HALT",
+        "FAILED",
+        "STARTING",
+        "STOPPED",
+        "HALTED",
+        "ERROR",
+        "STALE",
+        "UNKNOWN",
     }
-
-    if not os.path.exists(LOG_PATH):
-        return diag
-
-    try:
-        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
-    except Exception:
-        print("Handled exception in dashboard.py:97", file=sys.stderr)
-        return diag
-
-    # Find the last loop start
-    last_loop_idx = -1
-    for i in range(len(lines) - 1, -1, -1):
-        if "Loop #" in lines[i]:
-            last_loop_idx = i
-            break
-
-    if last_loop_idx < 0:
-        return diag
-
-    block = lines[last_loop_idx:]
-    block_text = "".join(block)
-
-    # Loop number and time
-    m = re.search(r"Loop #(\d+)\s+.+?(\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC)", block_text)
-    if m:
-        diag["loop"] = int(m.group(1))
-        diag["loop_time"] = m.group(2)
-
-    # Candle OHLC
-    m = re.search(r"Candle\s+O=([\d.]+)\s+H=([\d.]+)\s+L=([\d.]+)\s+C=([\d.]+)", block_text)
-    if m:
-        diag["candle"] = {"o": float(m.group(1)), "h": float(m.group(2)),
-                          "l": float(m.group(3)), "c": float(m.group(4))}
-
-    # Signal result
-    m = re.search(r"Signal\s+:\s+(\w+)", block_text)
-    if m:
-        diag["signal"] = m.group(1)
-
-    # Balance
-    m = re.search(r"Balance\s+:\s+\$([\d.]+)", block_text)
-    if m:
-        diag["balance"] = float(m.group(1))
-
-    return diag
-
-
-def _connect_research_db() -> sqlite3.Connection:
-    uri_path = os.path.abspath(RESEARCH_DB_PATH).replace("\\", "/")
-    return sqlite3.connect(
-        f"file:{uri_path}?mode=ro&immutable=1",
-        uri=True,
-        timeout=5,
-    )
-
-
-def _next_research_run() -> str:
-    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    candidate = now.replace(minute=RESEARCH_CRON_MINUTE)
-    if candidate <= now:
-        candidate += timedelta(hours=1)
-    return candidate.strftime("%Y-%m-%d %H:%M UTC")
-
-
-def _research_row(row: sqlite3.Row) -> dict:
-    item = dict(row)
-    raw = item.pop("metadata_json", "") or "{}"
-    try:
-        metadata = json.loads(raw)
-    except json.JSONDecodeError:
-        print("Handled exception in dashboard.py:160", file=sys.stderr)
-        metadata = {}
-    item["metadata"] = metadata if isinstance(metadata, dict) else {}
-    return item
-
-
-def _research_snapshot() -> dict:
-    """Return latest read-only shadow scanner status for the dashboard."""
-    empty = {
-        "available": False,
-        "status": "No shadow scanner database yet",
-        "latest_run": "",
-        "symbols_scanned": 0,
-        "rows_7d": 0,
-        "watch_7d": 0,
-        "next_run": _next_research_run(),
-        "watchlist": [],
-        "latest_signals": [],
+)
+_WATCHDOG_STATES = frozenset(
+    {
+        "STARTING",
+        "SYNCHRONIZING",
+        "HEALTHY",
+        "DEGRADED",
+        "ALERT",
+        "DISABLED",
+        "FAILED",
+        "STALE",
+        "UNKNOWN",
     }
-
-    if not os.path.exists(RESEARCH_DB_PATH):
-        return empty
-
-    try:
-        conn = _connect_research_db()
-        try:
-            conn.row_factory = sqlite3.Row
-            run = conn.execute(
-                """
-                SELECT run_id, started_at_utc, symbols_scanned, errors_json
-                FROM research_runs
-                ORDER BY started_at_utc DESC
-                LIMIT 1
-                """
-            ).fetchone()
-            if not run:
-                return {**empty, "status": "Shadow scanner has no runs yet"}
-
-            since = (
-                datetime.now(timezone.utc) - timedelta(days=7)
-            ).replace(microsecond=0).isoformat()
-            rows_7d = conn.execute(
-                "SELECT COUNT(*) FROM research_signals WHERE timestamp_utc >= ?",
-                (since,),
-            ).fetchone()[0]
-            watch_7d = conn.execute(
-                """
-                SELECT COUNT(*)
-                FROM research_signals
-                WHERE timestamp_utc >= ? AND action != 'NO_SIGNAL'
-                """,
-                (since,),
-            ).fetchone()[0]
-            watchlist = conn.execute(
-                """
-                SELECT timestamp_utc, strategy, symbol, action, score, reason, metadata_json
-                FROM research_signals
-                WHERE action != 'NO_SIGNAL'
-                ORDER BY timestamp_utc DESC, score DESC
-                LIMIT 6
-                """
-            ).fetchall()
-            latest_signals = conn.execute(
-                """
-                SELECT strategy, symbol, action, score, reason, metadata_json
-                FROM research_signals
-                WHERE run_id = ?
-                ORDER BY action != 'NO_SIGNAL' DESC, score DESC, symbol, strategy
-                LIMIT 12
-                """,
-                (run["run_id"],),
-            ).fetchall()
-        finally:
-            conn.close()
-
-        errors = json.loads(run["errors_json"] or "[]")
-        status = "Collecting shadow signals"
-        if errors:
-            status = f"Collecting with {len(errors)} skipped issue(s)"
-
-        return {
-            "available": True,
-            "status": status,
-            "latest_run": run["started_at_utc"],
-            "symbols_scanned": run["symbols_scanned"],
-            "rows_7d": rows_7d,
-            "watch_7d": watch_7d,
-            "next_run": _next_research_run(),
-            "watchlist": [_research_row(row) for row in watchlist],
-            "latest_signals": [_research_row(row) for row in latest_signals],
-        }
-    except Exception as exc:
-        print("Handled exception in dashboard.py:251", file=sys.stderr)
-        return {**empty, "status": f"Shadow scanner read error: {type(exc).__name__}"}
-
-
-def _readiness_snapshot() -> dict:
-    if evaluate_live_readiness is None:
-        return {
-            "verdict": "UNAVAILABLE",
-            "headline": "Readiness evaluator unavailable.",
-            "decision": "Dashboard could not import live_readiness.py.",
-            "failed_gates": 0,
-            "total_gates": 0,
-            "gates": [],
-            "no_go_rules": [],
-        }
-
-    try:
-        return evaluate_live_readiness(
-            trade_db_path=DB_PATH,
-            research_db_path=RESEARCH_DB_PATH,
-            read_only=True,
-        )
-    except Exception as exc:
-        print("Handled exception in dashboard.py:273", file=sys.stderr)
-        return {
-            "verdict": "UNAVAILABLE",
-            "headline": f"Readiness evaluator error: {type(exc).__name__}",
-            "decision": "Keep the bot in testnet mode until this is fixed.",
-            "failed_gates": 0,
-            "total_gates": 0,
-            "gates": [],
-            "no_go_rules": [],
-        }
-
-
-def _collect() -> dict:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    today_rows  = _query("SELECT * FROM trades WHERE date(timestamp)=? ORDER BY id DESC", (today,))
-    open_pos    = _query("SELECT * FROM trades WHERE exit_price IS NULL AND order_status='placed' ORDER BY id DESC")
-    recent      = _query("SELECT * FROM trades WHERE exit_price IS NOT NULL ORDER BY id DESC LIMIT 20")
-    all_closed  = _query("SELECT pnl_usd FROM trades WHERE exit_price IS NOT NULL")
-
-    today_closed = [r for r in today_rows if r["exit_price"] is not None]
-    today_pnl    = sum(r["pnl_usd"] or 0 for r in today_closed)
-    today_wins   = sum(1 for r in today_closed if (r["pnl_usd"] or 0) > 0)
-
-    total_closed = len(all_closed)
-    total_pnl    = sum(r["pnl_usd"] or 0 for r in all_closed)
-    total_wins   = sum(1 for r in all_closed if (r["pnl_usd"] or 0) > 0)
-    win_rate     = (total_wins / total_closed * 100) if total_closed else 0.0
-
-    daily_loss_usd = abs(today_pnl) if today_pnl < 0 else 0.0
-    if os.path.exists(DAILY_JSON):
-        try:
-            with open(DAILY_JSON) as fh:
-                d = json.load(fh)
-            if d.get("date") == today:
-                daily_loss_usd = float(d["loss_usd"])
-        except Exception:
-            print("Handled exception in dashboard.py:309", file=sys.stderr)
-            pass
-    daily_loss_pct = min(daily_loss_usd / MAX_DAILY_LOSS_USD * 100, 100.0)
-    halted = daily_loss_usd >= MAX_DAILY_LOSS_USD
-
-    bot_alive = False
-    if os.path.exists(LOG_PATH):
-        age_s = (_time.time() - os.path.getmtime(LOG_PATH))
-        bot_alive = age_s < 2100
-
-    # PnL history for equity curve
-    pnl_history = _query(
-        "SELECT timestamp, pnl_usd FROM trades WHERE exit_price IS NOT NULL ORDER BY id ASC"
-    )
-    equity_curve = []
-    running = 0
-    for r in pnl_history:
-        running += (r["pnl_usd"] or 0)
-        equity_curve.append({"t": r["timestamp"], "pnl": round(running, 2)})
-
-    return {
-        "now":             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "today":           today,
-        "bot_alive":       bot_alive,
-        "halted":          halted,
-        "today_attempts":  len(today_rows),
-        "today_closed":    len(today_closed),
-        "today_wins":      today_wins,
-        "today_losses":    len(today_closed) - today_wins,
-        "today_pnl":       round(today_pnl, 2),
-        "total_closed":    total_closed,
-        "total_pnl":       round(total_pnl, 2),
-        "win_rate":        round(win_rate, 1),
-        "daily_loss_usd":  round(daily_loss_usd, 2),
-        "daily_loss_pct":  round(daily_loss_pct, 1),
-        "open_positions":  open_pos,
-        "recent_trades":   recent,
-        "log_lines":       _log_tail(),
-        "diagnostics":     _parse_latest_diagnostics(),
-        "equity_curve":    equity_curve,
-        "research":        _research_snapshot(),
-        "readiness":       _readiness_snapshot(),
+)
+_PROTECTION_STATES = frozenset(
+    {"PROTECTED", "STOP_ONLY", "UNPROTECTED", "MANUAL_HALT", "FLAT", "UNKNOWN"}
+)
+_RISK_STATES = frozenset({"CURRENT", "STALE", "UNAVAILABLE"})
+_EVIDENCE_STATES = frozenset({"VALID", "INVALID", "UNAVAILABLE"})
+_READINESS_VERDICTS = frozenset({"NOT_READY", "CANARY_REVIEW_ONLY"})
+_PROMOTION_STAGES = frozenset(
+    {"RESEARCH", "SHADOW", "TESTNET_ENGINEERING", "MAINNET_DRY_RUN", "CANARY_REVIEW"}
+)
+_INTENT_STATUSES = frozenset(
+    {
+        "REGISTERED",
+        "ENTRY_PENDING",
+        "ENTRY_PARTIAL",
+        "ENTRY_FILLED",
+        "PROTECTED",
+        "PROTECTED_NO_TP",
+        "CLOSED",
+        "FAILED_FLAT",
+        "HALTED_MANUAL",
     }
+)
+_WARNINGS = frozenset(
+    {
+        "LEDGER_UNAVAILABLE",
+        "DAILY_LOSS_UNAVAILABLE",
+        "DAILY_LOSS_STALE",
+        "HEARTBEAT_UNAVAILABLE",
+        "HEARTBEAT_STALE",
+        "WATCHDOG_UNAVAILABLE",
+        "WATCHDOG_STALE",
+        "WATCHDOG_ATTENTION",
+        "PROMOTION_EVIDENCE_UNAVAILABLE",
+        "PROMOTION_EVIDENCE_INVALID",
+        "MANUAL_HALT_PRESENT",
+        "UNPROTECTED_INTENT_PRESENT",
+        "STOP_ONLY_PROTECTION",
+        "RUNNER_ATTENTION",
+    }
+)
+_SYMBOL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:-]{0,31}\Z")
+_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
 
+_STYLE = """
+:root{color-scheme:dark;--bg:#071016;--panel:#0e1a22;--line:#203441;--text:#e8f1f5;--muted:#91a7b4;--cyan:#45d8d0;--amber:#f4be5b;--red:#ff6d72;--green:#65d68b}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(circle at 80% 0,#12303b 0,transparent 36%),var(--bg);color:var(--text);font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;line-height:1.45}
+main{width:min(1180px,calc(100% - 32px));margin:0 auto;padding:28px 0 52px}
+header{display:flex;gap:20px;align-items:flex-start;justify-content:space-between;margin-bottom:22px}
+h1{font-family:system-ui,sans-serif;font-size:clamp(1.7rem,4vw,2.7rem);letter-spacing:-.04em;margin:.25rem 0}
+h2{font-family:system-ui,sans-serif;font-size:1rem;margin:0 0 14px}
+p{margin:.35rem 0;color:var(--muted)}
+.eyebrow{color:var(--cyan);font-size:.78rem;letter-spacing:.16em;text-transform:uppercase}
+.notice{border:1px solid #795c22;background:#2b210e;color:#ffe0a0;border-radius:12px;padding:11px 14px;max-width:390px;font-size:.8rem}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:12px}
+.card{background:linear-gradient(145deg,rgba(18,34,44,.96),rgba(10,22,29,.96));border:1px solid var(--line);border-radius:14px;padding:16px;min-width:0;box-shadow:0 14px 35px rgba(0,0,0,.16)}
+.label{color:var(--muted);font-size:.72rem;letter-spacing:.11em;text-transform:uppercase}
+.value{font-family:system-ui,sans-serif;font-weight:700;font-size:1.15rem;margin-top:7px;overflow-wrap:anywhere}
+.meta{color:var(--muted);font-size:.72rem;margin-top:6px;overflow-wrap:anywhere}
+.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:4px 8px;font-size:.7rem;color:var(--cyan);background:#0b2027}
+.warning{color:var(--amber);border-color:#6b5425;background:#281f0e}
+.danger{color:var(--red);border-color:#653039;background:#281318}
+.section{margin-top:12px}
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.warnings{display:flex;flex-wrap:wrap;gap:7px}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+table{border-collapse:collapse;width:100%;min-width:760px;font-size:.78rem}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:500;letter-spacing:.06em;text-transform:uppercase;font-size:.68rem;background:#0a171e}
+tr:last-child td{border-bottom:0}
+.empty{color:var(--muted);padding:24px;text-align:center}
+footer{margin-top:18px;color:var(--muted);font-size:.72rem;text-align:center}
+@media(max-width:920px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}header{flex-direction:column}.notice{max-width:none;width:100%}}
+@media(max-width:560px){main{width:min(100% - 20px,1180px);padding-top:18px}.grid{grid-template-columns:1fr}.card{padding:14px}}
+"""
+_STYLE_HASH = base64.b64encode(hashlib.sha256(_STYLE.encode("utf-8")).digest()).decode(
+    "ascii"
+)
+_CSP = (
+    "default-src 'none'; "
+    f"style-src 'sha256-{_STYLE_HASH}'; "
+    "script-src 'none'; img-src 'self'; connect-src 'self'; font-src 'none'; "
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+)
 
-# ---------------------------------------------------------------------------
-# HTML template
-# ---------------------------------------------------------------------------
-
-_HTML = r"""<!DOCTYPE html>
+_HTML = """<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>BitMEX Bot Dashboard</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: #0d0d0d; color: #e0e0e0; font-family: 'Segoe UI', monospace; font-size: 14px; }
-  .header { background: #1a1a2e; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #2a2a4a; }
-  .header h1 { font-size: 18px; color: #fff; letter-spacing: 1px; }
-  .status-badge { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-  .status-ok   { background: #1b5e20; color: #a5d6a7; }
-  .status-warn { background: #b71c1c; color: #ef9a9a; }
-  .status-halt { background: #6a1c1c; color: #ff8a80; border: 1px solid #ff5252; }
-  .ts { font-size: 12px; color: #888; }
-  .container { max-width: 1500px; margin: 0 auto; padding: 20px; }
-
-  /* Cards */
-  .grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }
-  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
-  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
-  .grid-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 20px; }
-  .card { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; }
-  .card-title { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
-  .card-value { font-size: 26px; font-weight: bold; color: #fff; }
-  .card-value-sm { font-size: 20px; font-weight: bold; color: #fff; }
-  .card-sub   { font-size: 12px; color: #666; margin-top: 4px; }
-  .pos { color: #66bb6a; } .neg { color: #ef5350; } .neu { color: #fff; }
-  .bar-wrap { background: #111; border-radius: 4px; height: 10px; overflow: hidden; margin-top: 8px; }
-  .bar-fill { height: 100%; border-radius: 4px; transition: width 0.4s; }
-  .bar-ok { background: #388e3c; } .bar-warn { background: #f57f17; } .bar-crit { background: #c62828; }
-  .card h3 { font-size: 13px; color: #aaa; margin-bottom: 12px; font-weight: normal; text-transform: uppercase; letter-spacing: 1px; }
-
-  /* Gauge */
-  .gauge-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  .gauge-label { font-size: 11px; color: #888; width: 80px; text-transform: uppercase; }
-  .gauge-track { flex: 1; height: 12px; background: #111; border-radius: 6px; position: relative; overflow: hidden; }
-  .gauge-fill { height: 100%; border-radius: 6px; transition: width 0.5s; }
-  .gauge-val { font-size: 13px; font-weight: bold; width: 60px; text-align: right; }
-  .gauge-marker { position: absolute; top: 0; height: 100%; width: 2px; background: #fff; z-index: 2; }
-
-
-  /* Price display */
-  .price-big { font-size: 32px; font-weight: bold; color: #fff; }
-  .price-label { font-size: 11px; color: #888; margin-top: 2px; }
-
-  /* Candle visualization */
-  .candle-vis { display: flex; align-items: center; justify-content: center; height: 100px; padding: 10px; }
-  .candle-stick { width: 2px; background: #888; position: relative; }
-  .candle-body { width: 20px; position: absolute; left: -9px; border-radius: 2px; }
-  .candle-green { background: #66bb6a; border: 1px solid #43a047; }
-  .candle-red { background: #ef5350; border: 1px solid #c62828; }
-
-  /* Tables */
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { color: #666; font-weight: normal; text-align: left; padding: 4px 8px; border-bottom: 1px solid #222; font-size: 11px; text-transform: uppercase; }
-  td { padding: 6px 8px; border-bottom: 1px solid #1a1a1a; }
-  tr:hover td { background: #1f1f1f; }
-  .tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: bold; }
-  .tag-short { background: #b71c1c33; color: #ef5350; border: 1px solid #b71c1c; }
-  .tag-long  { background: #1b5e2033; color: #66bb6a; border: 1px solid #1b5e20; }
-  .tag-tp    { background: #1b5e2033; color: #66bb6a; }
-  .tag-sl    { background: #b71c1c33; color: #ef5350; }
-  .empty { color: #444; font-style: italic; padding: 12px 8px; }
-
-  /* Research scanner */
-  .research-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 12px 0; }
-  .research-metric { background: #111; border: 1px solid #242424; border-radius: 6px; padding: 10px; }
-  .research-metric .k { color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
-  .research-metric .v { color: #fff; font-size: 18px; font-weight: bold; }
-  .research-list { border: 1px solid #242424; border-radius: 6px; overflow: hidden; }
-  .research-row { display: grid; grid-template-columns: 130px 170px 120px 70px 1fr; gap: 8px; align-items: center; padding: 8px 10px; border-bottom: 1px solid #202020; font-size: 12px; }
-  .research-row:last-child { border-bottom: 0; }
-  .research-row:hover { background: #1f1f1f; }
-  .research-reason { color: #aaa; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .research-quiet { padding: 14px 16px; border-bottom: 1px solid #202020; }
-  .research-quiet-title { color: #fff; font-size: 18px; font-weight: bold; margin-bottom: 4px; }
-  .research-quiet-sub { color: #777; font-size: 12px; }
-  .research-diag { display: grid; grid-template-columns: 120px repeat(4, 1fr); gap: 10px; padding: 9px 10px; border-bottom: 1px solid #202020; align-items: center; font-size: 12px; }
-  .research-diag:last-child { border-bottom: 0; }
-  .research-diag:hover { background: #1f1f1f; }
-  .research-diag-symbol { color: #fff; font-weight: bold; }
-  .research-diag-label { color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px; }
-  .research-diag-value { color: #d8d8d8; white-space: nowrap; }
-
-  /* Live readiness */
-  .readiness-head { display: grid; grid-template-columns: 220px 1fr 140px; gap: 14px; align-items: center; margin-bottom: 12px; }
-  .readiness-verdict { border-radius: 6px; padding: 12px; border: 1px solid #333; background: #111; }
-  .readiness-verdict .k { color: #777; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
-  .readiness-verdict .v { color: #fff; font-size: 20px; font-weight: bold; overflow-wrap: anywhere; }
-  .readiness-verdict.not-ready { border-color: #8a5a16; background: #211708; }
-  .readiness-verdict.reject { border-color: #8a1c1c; background: #220b0b; }
-  .readiness-verdict.review { border-color: #1b5e20; background: #0c1c0d; }
-  .readiness-copy { color: #bbb; font-size: 13px; line-height: 1.5; }
-  .readiness-count { text-align: right; color: #aaa; font-size: 12px; }
-  .readiness-count strong { display: block; color: #fff; font-size: 24px; }
-  .gate-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-  .gate-item { background: #111; border: 1px solid #242424; border-radius: 6px; padding: 10px; }
-  .gate-top { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
-  .gate-name { color: #fff; font-size: 13px; font-weight: bold; }
-  .gate-detail { color: #888; font-size: 12px; line-height: 1.4; }
-  .pill { display: inline-block; min-width: 44px; text-align: center; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-  .pill-pass { color: #a5d6a7; background: #1b5e2033; border: 1px solid #1b5e20; }
-  .pill-fail { color: #ef9a9a; background: #b71c1c33; border: 1px solid #b71c1c; }
-  .pill-warn, .pill-armed, .pill-pending { color: #ffcc80; background: #8a5a1633; border: 1px solid #8a5a16; }
-  .pill-clear { color: #a5d6a7; background: #1b5e2033; border: 1px solid #1b5e20; }
-  .pill-triggered { color: #ef9a9a; background: #b71c1c33; border: 1px solid #b71c1c; }
-  .nogo-list { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-
-  /* Log */
-  .log-box { background: #0a0a0a; border: 1px solid #1e1e1e; border-radius: 6px; padding: 12px; height: 350px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 12px; line-height: 1.6; }
-  .log-line { white-space: pre-wrap; word-break: break-all; }
-  .log-short { color: #ef5350; } .log-long { color: #66bb6a; } .log-notrade { color: #555; }
-  .log-warn  { color: #ffb74d; } .log-ok { color: #4fc3f7; } .log-ml { color: #ce93d8; }
-  .log-loop  { color: #fff; font-weight: bold; }
-  .log-pass  { color: #66bb6a; } .log-fail  { color: #ef5350; }
-
-  /* Equity chart */
-  .equity-chart { width: 100%; height: 120px; position: relative; }
-  .equity-svg { width: 100%; height: 100%; }
-
-  .footer { text-align: center; color: #444; font-size: 12px; padding: 16px; }
-
-  @media (max-width: 900px) {
-    .grid-5, .grid-4 { grid-template-columns: repeat(2, 1fr); }
-    .grid-2, .grid-2-1 { grid-template-columns: 1fr; }
-    .research-strip { grid-template-columns: repeat(2, 1fr); }
-    .research-row { grid-template-columns: 1fr; gap: 4px; }
-    .research-diag { grid-template-columns: 1fr 1fr; }
-    .readiness-head, .gate-grid, .nogo-list { grid-template-columns: 1fr; }
-    .readiness-count { text-align: left; }
-    .research-reason { white-space: normal; }
-  }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta http-equiv="refresh" content="30">
+  <title>BitMexBot Operator View</title>
+  <style>{{ style|safe }}</style>
 </head>
 <body>
-<div class="header">
-  <h1>BitMEX Bot &mdash; Dashboard</h1>
-  <div style="display:flex;align-items:center;gap:16px;">
-    <span class="ts" id="ts">--</span>
-    <span class="status-badge" id="status-badge">Loading...</span>
-  </div>
-</div>
-<div class="container">
-
-  <!-- Row 1: Key metrics -->
-  <div class="grid-5">
-    <div class="card">
-      <div class="card-title">Price</div>
-      <div class="price-big" id="price">--</div>
-      <div class="price-label" id="price-label">BTC/USDT</div>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">Read-only operator view</div>
+      <h1>BitMexBot safety telemetry</h1>
+      <p>Sanitized status snapshot. Refreshes every 30 seconds.</p>
     </div>
-    <div class="card">
-      <div class="card-title">Today PnL</div>
-      <div class="card-value" id="today-pnl">--</div>
-      <div class="card-sub" id="today-sub">--</div>
+    <div class="notice"><strong>TESTNET RESEARCH ONLY</strong><br>No trading controls are exposed. Real-funds execution remains disabled.</div>
+  </header>
+
+  <section class="grid" aria-label="Primary status">
+    <article class="card"><div class="label">Snapshot</div><div class="value">{{ "FRESH" if snapshot_fresh else "STALE" }}</div><div class="meta">{{ snapshot.generated_at_utc }}</div></article>
+    <article class="card"><div class="label">Data state</div><div class="value">{{ snapshot.data_state }}</div><div class="meta">Schema {{ snapshot.schema_version }}</div></article>
+    <article class="card"><div class="label">Environment</div><div class="value">{{ snapshot.environment }}</div><div class="meta">Production enabled: NO</div></article>
+    <article class="card"><div class="label">Protection</div><div class="value">{{ snapshot.ledger.protection_state }}</div><div class="meta">{{ snapshot.ledger.open_intents }} active, {{ snapshot.ledger.manual_halts }} manual halt</div></article>
+  </section>
+
+  <section class="grid" aria-label="Operational status">
+    <article class="card"><div class="label">Runner</div><div class="value">{{ snapshot.runner.state }}</div><div class="meta">{{ snapshot.runner.heartbeat_at_utc or "No trusted heartbeat" }}</div></article>
+    <article class="card"><div class="label">Watchdog</div><div class="value">{{ snapshot.watchdog.state }}</div><div class="meta">{{ snapshot.watchdog.checked_at_utc or "No trusted watchdog state" }}</div></article>
+    <article class="card"><div class="label">Daily loss</div><div class="value">{% if snapshot.risk.daily_loss_usdt is not none %}{{ "%.4f"|format(snapshot.risk.daily_loss_usdt) }} USDT{% else %}UNAVAILABLE{% endif %}</div><div class="meta">{{ snapshot.risk.state }}{% if snapshot.risk.date %} · {{ snapshot.risk.date }}{% endif %}</div></article>
+    <article class="card"><div class="label">Promotion</div><div class="value">{{ snapshot.readiness.stage }}</div><div class="meta">{{ snapshot.readiness.verdict }} · {{ snapshot.readiness.blocker_count }} blocker(s)</div></article>
+  </section>
+
+  <section class="card section" aria-labelledby="warning-heading">
+    <div class="section-head"><h2 id="warning-heading">Attention signals</h2><span class="pill">{{ snapshot.warnings|length }} warning(s)</span></div>
+    <div class="warnings">
+      {% for warning in snapshot.warnings %}<span class="pill warning">{{ warning }}</span>{% else %}<span class="pill">NO_TELEMETRY_WARNINGS</span>{% endfor %}
     </div>
-    <div class="card">
-      <div class="card-title">All-time PnL</div>
-      <div class="card-value" id="total-pnl">--</div>
-      <div class="card-sub" id="total-sub">-- trades</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Win Rate</div>
-      <div class="card-value" id="win-rate">--</div>
-      <div class="card-sub">all closed trades</div>
-    </div>
-    <div class="card">
-      <div class="card-title">Balance</div>
-      <div class="card-value" id="balance">--</div>
-      <div class="card-sub" id="loop-info">--</div>
-    </div>
-  </div>
+  </section>
 
-  <!-- Row 2: Daily loss gauge -->
-  <div class="grid-4">
-    <div class="card">
-      <div class="card-title">Daily Loss Limit</div>
-      <div class="card-value-sm" id="daily-loss">--</div>
-      <div class="card-sub" id="daily-sub">--</div>
-      <div class="bar-wrap"><div class="bar-fill bar-ok" id="loss-bar" style="width:0%"></div></div>
-    </div>
-  </div>
-
-  <!-- Row 3: Research scanner -->
-  <div class="card" style="margin-bottom:20px;">
-    <h3>Research Scanner</h3>
-    <div class="card-sub" id="research-status">Loading shadow scanner...</div>
-    <div class="research-strip">
-      <div class="research-metric"><div class="k">Latest Run</div><div class="v" id="research-run">--</div></div>
-      <div class="research-metric"><div class="k">Next Run</div><div class="v" id="research-next">--</div></div>
-      <div class="research-metric"><div class="k">Symbols</div><div class="v" id="research-symbols">--</div></div>
-      <div class="research-metric"><div class="k">Rows 7d</div><div class="v" id="research-rows">--</div></div>
-      <div class="research-metric"><div class="k">Watch 7d</div><div class="v" id="research-watch">--</div></div>
-    </div>
-    <div class="research-list" id="research-list">
-      <div class="empty">No shadow scanner data yet.</div>
-    </div>
-  </div>
-
-  <!-- Row 4: Live readiness -->
-  <div class="card" style="margin-bottom:20px;">
-    <h3>Live Readiness / No-Go</h3>
-    <div class="readiness-head">
-      <div class="readiness-verdict not-ready" id="readiness-verdict">
-        <div class="k">Verdict</div>
-        <div class="v" id="readiness-verdict-text">--</div>
-      </div>
-      <div class="readiness-copy">
-        <div id="readiness-headline">Loading readiness evaluator...</div>
-        <div class="card-sub" id="readiness-decision">--</div>
-      </div>
-      <div class="readiness-count">
-        Failed gates
-        <strong id="readiness-failed">--</strong>
-        <span id="readiness-total">--</span>
-      </div>
-    </div>
-    <div class="gate-grid" id="readiness-gates"></div>
-    <div class="nogo-list" id="readiness-nogo"></div>
-  </div>
-
-  <!-- Row 5: Equity curve -->
-  <div class="card" style="margin-bottom:20px;">
-    <h3>Equity Curve</h3>
-    <div class="equity-chart" id="equity-chart">
-      <div style="color:#444;font-style:italic;padding:30px;text-align:center" id="equity-placeholder">No closed trades yet. Equity curve will appear after first trade.</div>
-      <svg class="equity-svg" id="equity-svg" style="display:none"></svg>
-    </div>
-  </div>
-
-  <!-- Row 6: Open positions -->
-  <div class="card" style="margin-bottom:20px;">
-    <h3>Open Positions</h3>
-    <table>
-      <thead><tr><th>Order ID</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Size (BTC)</th><th>Opened (UTC)</th></tr></thead>
-      <tbody id="open-body"><tr><td class="empty" colspan="7">No open positions.</td></tr></tbody>
-    </table>
-  </div>
-
-  <!-- Row 7: Trades + Log -->
-  <div class="grid-2">
-    <div class="card">
-      <h3>Recent Closed Trades</h3>
-      <table>
-        <thead><tr><th>Time</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Closed By</th></tr></thead>
-        <tbody id="trades-body"><tr><td class="empty" colspan="6">No trades yet.</td></tr></tbody>
-      </table>
-    </div>
-    <div class="card">
-      <h3>Live Log</h3>
-      <div class="log-box" id="log-box">Loading...</div>
-    </div>
-  </div>
-</div>
-<div class="footer">Auto-refreshes every 30s &nbsp;|&nbsp; next in <span id="countdown">30</span>s</div>
-
-<script>
-let countdown = 30;
-const MAX_LOSS = """ + str(MAX_DAILY_LOSS_USD) + """;
-
-function pnlClass(v) { return v > 0 ? 'pos' : v < 0 ? 'neg' : 'neu'; }
-function fmt(v) { if (v===null||v===undefined) return '--'; return (v>=0?'+':'')+v.toFixed(2); }
-function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function actionTag(action) {
-  const cls = action === 'WATCH_LONG' ? 'tag-long' : action === 'WATCH_SHORT' ? 'tag-short' : '';
-  return `<span class="tag ${cls}">${esc(action || '--')}</span>`;
-}
-function fmtPct(v) {
-  if (v === null || v === undefined || Number.isNaN(Number(v))) return '--';
-  return `${Number(v).toFixed(3)}%`;
-}
-function fmtRatio(v) {
-  if (v === null || v === undefined || Number.isNaN(Number(v))) return '--';
-  return `${Number(v).toFixed(2)}x`;
-}
-function shortTime(v) {
-  return v ? v.replace('T', ' ').slice(11, 16) + ' UTC' : '--';
-}
-function researchDiagnostics(rows) {
-  const bySymbol = {};
-  (rows || []).forEach(r => {
-    const symbol = r.symbol || '--';
-    bySymbol[symbol] = bySymbol[symbol] || {};
-    bySymbol[symbol][r.strategy] = r;
-  });
-  return Object.entries(bySymbol).map(([symbol, items]) => {
-    const trend = items.btc_trend_breakout_vol_filter || {};
-    const vol = items.vol_spike_reversion_proxy || {};
-    const funding = items.funding_extreme_watch || {};
-    const tm = trend.metadata || {};
-    const vm = vol.metadata || {};
-    const fm = funding.metadata || {};
-    const close = Number(tm.close || vm.close || 0);
-    const upGap = close && tm.prior_high_20 ? (Number(tm.prior_high_20) - close) / close * 100 : null;
-    const downGap = close && tm.prior_low_20 ? (close - Number(tm.prior_low_20)) / close * 100 : null;
-    const fundingRate = fm.funding_rate === null || fm.funding_rate === undefined ? null : Number(fm.funding_rate) * 100;
-    return {
-      symbol,
-      fundingRate,
-      trendVolume: tm.volume_ratio,
-      spikeVolume: vm.volume_ratio,
-      rangeAtr: vm.range_atr_ratio,
-      breakout: `up ${fmtPct(upGap)} / down ${fmtPct(downGap)}`,
-    };
-  });
-}
-function readinessClass(verdict) {
-  if (verdict === 'READY_FOR_MANUAL_REVIEW') return 'review';
-  if (verdict === 'REJECT_DO_NOT_PROMOTE') return 'reject';
-  return 'not-ready';
-}
-function pillClass(status) {
-  return `pill-${String(status || '').toLowerCase().replace(/_/g, '-')}`;
-}
-function renderGate(item) {
-  const status = item.status || '--';
-  return `<div class="gate-item">
-    <div class="gate-top">
-      <span class="pill ${pillClass(status)}">${esc(status)}</span>
-      <span class="gate-name">${esc(item.name || '--')}</span>
-    </div>
-    <div class="gate-detail">${esc(item.detail || '')}</div>
-  </div>`;
-}
-function renderReadiness(readiness) {
-  readiness = readiness || {};
-  const verdict = readiness.verdict || 'UNAVAILABLE';
-  const verdictBox = document.getElementById('readiness-verdict');
-  verdictBox.className = `readiness-verdict ${readinessClass(verdict)}`;
-  document.getElementById('readiness-verdict-text').textContent = verdict.replace(/_/g, ' ');
-  document.getElementById('readiness-headline').textContent = readiness.headline || '--';
-  document.getElementById('readiness-decision').textContent = readiness.decision || '--';
-  document.getElementById('readiness-failed').textContent = readiness.failed_gates ?? '--';
-  document.getElementById('readiness-total').textContent = `of ${readiness.total_gates ?? '--'}`;
-
-  const gates = readiness.gates || [];
-  document.getElementById('readiness-gates').innerHTML = gates.length
-    ? gates.map(renderGate).join('')
-    : '<div class="empty">No readiness gates available.</div>';
-
-  const rules = readiness.no_go_rules || [];
-  document.getElementById('readiness-nogo').innerHTML = rules.length
-    ? rules.map(renderGate).join('')
-    : '<div class="empty">No no-go rules available.</div>';
-}
-
-function colorLog(line) {
-  if (line.includes('[SHORT]'))      return `<span class="log-short">${esc(line)}</span>`;
-  if (line.includes('[LONG]'))       return `<span class="log-long">${esc(line)}</span>`;
-  if (line.includes('[PASS]'))       return `<span class="log-pass">${esc(line)}</span>`;
-  if (line.includes('[FAIL]'))       return `<span class="log-fail">${esc(line)}</span>`;
-  if (line.includes('[NO_TRADE]'))   return `<span class="log-notrade">${esc(line)}</span>`;
-  if (line.includes('[ML]'))         return `<span class="log-ml">${esc(line)}</span>`;
-  if (line.includes('[WARN]')||line.includes('[ERROR]')) return `<span class="log-warn">${esc(line)}</span>`;
-  if (line.includes('[OK]')||line.includes('[LOG]'))     return `<span class="log-ok">${esc(line)}</span>`;
-  if (line.includes('Loop #'))       return `<span class="log-loop">${esc(line)}</span>`;
-  return `<span>${esc(line)}</span>`;
-}
-
-function renderEquity(data) {
-  const svg = document.getElementById('equity-svg');
-  const placeholder = document.getElementById('equity-placeholder');
-  if (!data || !data.length) { svg.style.display = 'none'; placeholder.style.display = 'block'; return; }
-  svg.style.display = 'block'; placeholder.style.display = 'none';
-
-  const w = svg.clientWidth || 600, h = svg.clientHeight || 120;
-  const vals = data.map(d => d.pnl);
-  const mn = Math.min(0, ...vals), mx = Math.max(0, ...vals);
-  const range = mx - mn || 1;
-  const pad = 10;
-
-  let pts = data.map((d, i) => {
-    const x = pad + (i / Math.max(data.length - 1, 1)) * (w - 2*pad);
-    const y = h - pad - ((d.pnl - mn) / range) * (h - 2*pad);
-    return `${x},${y}`;
-  }).join(' ');
-
-  const zeroY = h - pad - ((0 - mn) / range) * (h - 2*pad);
-  svg.innerHTML = `
-    <line x1="${pad}" y1="${zeroY}" x2="${w-pad}" y2="${zeroY}" stroke="#333" stroke-dasharray="4"/>
-    <polyline fill="none" stroke="#4fc3f7" stroke-width="2" points="${pts}"/>
-    <text x="${w-pad}" y="${zeroY-4}" fill="#555" font-size="10" text-anchor="end">$0</text>
-    <text x="${w-pad}" y="${h-2}" fill="#666" font-size="10" text-anchor="end">$${fmt(vals[vals.length-1])}</text>
-  `;
-}
-
-function renderResearch(research) {
-  research = research || {};
-  document.getElementById('research-status').textContent = research.status || 'Shadow scanner unavailable';
-  document.getElementById('research-run').textContent = research.latest_run ? research.latest_run.replace('T', ' ').slice(0, 16) + ' UTC' : '--';
-  document.getElementById('research-next').textContent = research.next_run ? shortTime(research.next_run) : '--';
-  document.getElementById('research-symbols').textContent = research.symbols_scanned ?? '--';
-  document.getElementById('research-rows').textContent = research.rows_7d ?? '--';
-  document.getElementById('research-watch').innerHTML = `<span class="${(research.watch_7d || 0) > 0 ? 'pos' : 'neu'}">${research.watch_7d ?? '--'}</span>`;
-
-  const list = document.getElementById('research-list');
-  if (!research.available) {
-    list.innerHTML = `<div class="empty">${esc(research.status || 'No shadow scanner data yet.')}</div>`;
-    return;
-  }
-
-  const watchRows = research.watchlist || [];
-  const latestRows = research.latest_signals || [];
-  if (watchRows.length) {
-    list.innerHTML = watchRows.map(r => `<div class="research-row">
-      <div>${esc(r.symbol || '--')}</div>
-      <div>${esc(r.strategy || '--')}</div>
-      <div>${actionTag(r.action)}</div>
-      <div>${Number(r.score || 0).toFixed(1)}</div>
-      <div class="research-reason" title="${esc(r.reason || '')}">${esc(r.reason || '--')}</div>
-    </div>`).join('');
-    return;
-  }
-
-  const diagnostics = researchDiagnostics(latestRows);
-  if (!diagnostics.length) {
-    list.innerHTML = '<div class="empty">Scanner is active, but no diagnostics are available yet.</div>';
-    return;
-  }
-
-  list.innerHTML = `
-    <div class="research-quiet">
-      <div class="research-quiet-title">No watch candidates right now</div>
-      <div class="research-quiet-sub">Latest scanner pass stayed below every watch threshold.</div>
-    </div>
-    ${diagnostics.map(d => `<div class="research-diag">
-      <div class="research-diag-symbol">${esc(d.symbol)}</div>
-      <div><div class="research-diag-label">Funding</div><div class="research-diag-value">${fmtPct(d.fundingRate)}</div></div>
-      <div><div class="research-diag-label">Trend Vol</div><div class="research-diag-value">${fmtRatio(d.trendVolume)}</div></div>
-      <div><div class="research-diag-label">Spike</div><div class="research-diag-value">${fmtRatio(d.spikeVolume)} / ${fmtRatio(d.rangeAtr)} ATR</div></div>
-      <div><div class="research-diag-label">Breakout Gap</div><div class="research-diag-value">${esc(d.breakout)}</div></div>
-    </div>`).join('')}
-  `;
-}
-
-async function refresh() {
-  let d;
-  try { d = await (await fetch('/api/data')).json(); }
-  catch(e) { document.getElementById('status-badge').textContent='Fetch error'; return; }
-
-  const diag = d.diagnostics || {};
-
-  // Header
-  document.getElementById('ts').textContent = d.now;
-  const badge = document.getElementById('status-badge');
-  if (d.halted) { badge.textContent='HALTED'; badge.className='status-badge status-halt'; }
-  else if (d.bot_alive) { badge.textContent='Bot Running'; badge.className='status-badge status-ok'; }
-  else { badge.textContent='Bot Inactive'; badge.className='status-badge status-warn'; }
-
-  // Price
-  const price = (diag.candle || {}).c;
-  document.getElementById('price').textContent = price ? '$' + price.toFixed(2) : '--';
-  document.getElementById('price-label').textContent = price ? 'BTC/USDT 15m' : 'BTC/USDT';
-
-  // PnL cards
-  document.getElementById('today-pnl').innerHTML = `<span class="${pnlClass(d.today_pnl)}">$${fmt(d.today_pnl)}</span>`;
-  document.getElementById('today-sub').textContent = `${d.today_closed} closed (${d.today_wins}W / ${d.today_losses}L)`;
-  document.getElementById('total-pnl').innerHTML = `<span class="${pnlClass(d.total_pnl)}">$${fmt(d.total_pnl)}</span>`;
-  document.getElementById('total-sub').textContent = `${d.total_closed} trades`;
-  document.getElementById('win-rate').textContent = d.win_rate + '%';
-  document.getElementById('balance').textContent = diag.balance ? '$' + diag.balance.toFixed(2) : '--';
-  document.getElementById('loop-info').textContent = diag.loop ? `Loop #${diag.loop} | ${diag.loop_time}` : '--';
-
-  // Daily loss
-  document.getElementById('daily-loss').textContent = '$' + d.daily_loss_usd.toFixed(2);
-  document.getElementById('daily-sub').textContent = d.daily_loss_pct + '% of $' + MAX_LOSS.toFixed(2);
-  const bar = document.getElementById('loss-bar');
-  bar.style.width = d.daily_loss_pct + '%';
-  bar.className = 'bar-fill ' + (d.daily_loss_pct>=100?'bar-crit':d.daily_loss_pct>=70?'bar-warn':'bar-ok');
-
-  // Equity curve
-  renderEquity(d.equity_curve);
-
-  // Research scanner
-  renderResearch(d.research);
-
-  // Live readiness / no-go rules
-  renderReadiness(d.readiness);
-
-  // Open positions
-  const ob = document.getElementById('open-body');
-  ob.innerHTML = d.open_positions.length ? d.open_positions.map(r=>`<tr>
-    <td style="font-size:11px;font-family:monospace">${esc(r.order_id||'--')}</td>
-    <td><span class="tag tag-${r.signal.toLowerCase()}">${r.signal}</span></td>
-    <td>${r.entry_price.toFixed(2)}</td><td>${r.sl_price.toFixed(2)}</td><td>${r.tp_price.toFixed(2)}</td>
-    <td>${r.position_size_btc.toFixed(8)}</td><td>${esc(r.timestamp)}</td></tr>`).join('')
-    : '<tr><td class="empty" colspan="7">No open positions.</td></tr>';
-
-  // Recent trades
-  const tb = document.getElementById('trades-body');
-  tb.innerHTML = d.recent_trades.length ? d.recent_trades.map(r=>{
-    const reason=(r.exit_reason||'--').toUpperCase();
-    return `<tr>
-      <td style="font-size:11px;color:#666">${esc((r.timestamp||'').slice(0,16))}</td>
-      <td><span class="tag tag-${(r.signal||'').toLowerCase()}">${r.signal}</span></td>
-      <td>${r.entry_price.toFixed(2)}</td><td>${(r.exit_price||0).toFixed(2)}</td>
-      <td class="${pnlClass(r.pnl_usd)}">$${fmt(r.pnl_usd)}</td>
-      <td><span class="tag ${reason==='TP'?'tag-tp':reason==='SL'?'tag-sl':''}">${reason}</span></td></tr>`;
-  }).join('') : '<tr><td class="empty" colspan="6">No trades yet.</td></tr>';
-
-  // Log
-  const log = document.getElementById('log-box');
-  const atBottom = log.scrollHeight - log.clientHeight <= log.scrollTop + 40;
-  log.innerHTML = d.log_lines.map(colorLog).map(l=>`<div class="log-line">${l}</div>`).join('');
-  if (atBottom) log.scrollTop = log.scrollHeight;
-}
-
-setInterval(()=>{ countdown--; if(countdown<=0){countdown=30;refresh();} document.getElementById('countdown').textContent=countdown; },1000);
-refresh();
-</script>
+  <section class="card section" aria-labelledby="intent-heading">
+    <div class="section-head"><h2 id="intent-heading">Recent sanitized intents</h2><span class="pill">{{ snapshot.ledger.total_intents }} total</span></div>
+    {% if snapshot.ledger.recent_intents %}
+    <div class="table-wrap"><table>
+      <thead><tr><th>Environment</th><th>Symbol</th><th>Side</th><th>Status</th><th>Requested</th><th>Filled</th><th>Closed</th><th>Net PnL</th><th>Updated UTC</th></tr></thead>
+      <tbody>{% for intent in snapshot.ledger.recent_intents %}<tr><td>{{ intent.environment }}</td><td>{{ intent.symbol }}</td><td>{{ intent.side }}</td><td>{{ intent.status }}</td><td>{{ intent.requested_contracts }}</td><td>{{ intent.filled_contracts }}</td><td>{{ intent.closed_contracts }}</td><td>{% if intent.net_pnl_usdt is none %}--{% else %}{{ "%.4f"|format(intent.net_pnl_usdt) }}{% endif %}</td><td>{{ intent.updated_at_utc }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+    {% else %}<div class="empty">No sanitized execution intents are available.</div>{% endif %}
+  </section>
+  <footer>Observation only. Use the private runbook and exchange console for operator actions.</footer>
+</main>
 </body>
 </html>"""
 
 
-@app.route("/")
-def index():
-    return render_template_string(_HTML)
+class SnapshotValidationError(RuntimeError):
+    """Raised when the public snapshot cannot be trusted."""
 
 
-@app.route("/api/data")
-def api_data():
-    return jsonify(_collect())
+@dataclass(frozen=True)
+class SnapshotView:
+    payload: dict[str, Any]
+    fresh: bool
 
 
-if __name__ == "__main__":
-    bind_host = "0.0.0.0"
+F = TypeVar("F", bound=Callable[..., Response | str])
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     try:
-        import subprocess
-        ts_ip = subprocess.check_output(
-            ["tailscale", "ip", "-4"], text=True, timeout=5
-        ).strip()
-        bind_host = ts_ip
-    except Exception:
-        print("Handled exception in dashboard.py:893", file=sys.stderr)
-        pass
+        parsed = int(value)
+    except (TypeError, ValueError):  # agent-quality: allow: invalid public configuration is returned as unavailable
+        return None
+    return parsed if parsed > 0 else None
 
-    print(f"Dashboard running at http://{bind_host}:{DASH_PORT}")
-    print(f"  DB  : {os.path.abspath(DB_PATH)}")
-    print(f"  Log : {os.path.abspath(LOG_PATH)}")
-    app.run(host=bind_host, port=DASH_PORT, debug=False)
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise SnapshotValidationError("object expected")
+    return value
+
+
+def _enum(mapping: Mapping[str, Any], key: str, allowed: frozenset[str]) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or value not in allowed:
+        raise SnapshotValidationError("enum value rejected")
+    return value
+
+
+def _boolean(mapping: Mapping[str, Any], key: str) -> bool:
+    value = mapping.get(key)
+    if not isinstance(value, bool):
+        raise SnapshotValidationError("boolean expected")
+    return value
+
+
+def _bounded_int(mapping: Mapping[str, Any], key: str, maximum: int = 1_000_000_000) -> int:
+    value = mapping.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        raise SnapshotValidationError("bounded integer expected")
+    return value
+
+
+def _number(mapping: Mapping[str, Any], key: str, *, nullable: bool = False) -> float | None:
+    value = mapping.get(key)
+    if value is None and nullable:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SnapshotValidationError("number expected")
+    result = float(value)
+    if not math.isfinite(result) or abs(result) > 1_000_000_000_000:
+        raise SnapshotValidationError("finite bounded number expected")
+    return result
+
+
+def _parse_timestamp(value: Any, *, nullable: bool = False) -> tuple[str | None, datetime | None]:
+    if value is None and nullable:
+        return None, None
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise SnapshotValidationError("timestamp rejected")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SnapshotValidationError("timestamp rejected") from exc
+    if parsed.tzinfo is None:
+        raise SnapshotValidationError("timezone required")
+    normalized = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return normalized, parsed.astimezone(timezone.utc)
+
+
+def _sanitize_intent(value: Any) -> dict[str, Any]:
+    intent = _mapping(value)
+    environment = _enum(intent, "environment", frozenset({"TESTNET", "DRY_RUN"}))
+    symbol = intent.get("symbol")
+    if not isinstance(symbol, str) or not _SYMBOL_PATTERN.fullmatch(symbol):
+        raise SnapshotValidationError("symbol rejected")
+    requested = _bounded_int(intent, "requested_contracts")
+    filled = _bounded_int(intent, "filled_contracts")
+    closed = _bounded_int(intent, "closed_contracts")
+    if requested <= 0 or filled > requested or closed > filled:
+        raise SnapshotValidationError("contract invariant rejected")
+    expected_loss = _number(intent, "expected_max_loss_usdt")
+    if expected_loss is None or expected_loss <= 0:
+        raise SnapshotValidationError("loss evidence rejected")
+    created, _ = _parse_timestamp(intent.get("created_at_utc"))
+    updated, _ = _parse_timestamp(intent.get("updated_at_utc"))
+    return {
+        "environment": environment,
+        "symbol": symbol,
+        "side": _enum(intent, "side", frozenset({"LONG", "SHORT"})),
+        "status": _enum(intent, "status", _INTENT_STATUSES),
+        "requested_contracts": requested,
+        "filled_contracts": filled,
+        "closed_contracts": closed,
+        "expected_max_loss_usdt": expected_loss,
+        "net_pnl_usdt": _number(intent, "net_pnl_usdt", nullable=True),
+        "created_at_utc": created,
+        "updated_at_utc": updated,
+    }
+
+
+def _sanitize_timed_state(
+    value: Any,
+    *,
+    allowed_states: frozenset[str],
+    timestamp_key: str,
+) -> dict[str, Any]:
+    state = _mapping(value)
+    normalized_timestamp, _ = _parse_timestamp(
+        state.get(timestamp_key), nullable=True
+    )
+    clean = {
+        "state": _enum(state, "state", allowed_states),
+        timestamp_key: normalized_timestamp,
+        "fresh": _boolean(state, "fresh"),
+    }
+    if clean["fresh"] and (
+        normalized_timestamp is None or clean["state"] in {"STALE", "UNKNOWN"}
+    ):
+        raise SnapshotValidationError("fresh timed state is inconsistent")
+    return clean
+
+
+def _sanitize_snapshot(value: Any) -> tuple[dict[str, Any], datetime]:
+    source = _mapping(value)
+    if source.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+        raise SnapshotValidationError("snapshot schema rejected")
+    generated, generated_dt = _parse_timestamp(source.get("generated_at_utc"))
+    if generated_dt is None:
+        raise SnapshotValidationError("snapshot timestamp missing")
+    if source.get("production_enabled") is not False or source.get("actions_enabled") is not False:
+        raise SnapshotValidationError("unsafe enablement flag rejected")
+
+    runner = _sanitize_timed_state(
+        source.get("runner"),
+        allowed_states=_RUNNER_STATES,
+        timestamp_key="heartbeat_at_utc",
+    )
+    watchdog = _sanitize_timed_state(
+        source.get("watchdog"),
+        allowed_states=_WATCHDOG_STATES,
+        timestamp_key="checked_at_utc",
+    )
+
+    ledger_source = _mapping(source.get("ledger"))
+    recent_source = ledger_source.get("recent_intents")
+    if not isinstance(recent_source, list) or len(recent_source) > 20:
+        raise SnapshotValidationError("recent intent list rejected")
+    recent = [_sanitize_intent(item) for item in recent_source]
+    latest_source = ledger_source.get("latest_intent")
+    latest = None if latest_source is None else _sanitize_intent(latest_source)
+    if recent and latest != recent[0]:
+        raise SnapshotValidationError("latest intent is inconsistent")
+    if not recent and latest is not None:
+        raise SnapshotValidationError("latest intent is inconsistent")
+    ledger = {
+        "available": _boolean(ledger_source, "available"),
+        "total_intents": _bounded_int(ledger_source, "total_intents"),
+        "open_intents": _bounded_int(ledger_source, "open_intents"),
+        "manual_halts": _bounded_int(ledger_source, "manual_halts"),
+        "protection_state": _enum(ledger_source, "protection_state", _PROTECTION_STATES),
+        "latest_intent": latest,
+        "recent_intents": recent,
+    }
+    if not ledger["available"] and (
+        ledger["total_intents"] != 0
+        or ledger["open_intents"] != 0
+        or ledger["manual_halts"] != 0
+        or ledger["protection_state"] != "UNKNOWN"
+        or recent
+    ):
+        raise SnapshotValidationError("unavailable ledger is inconsistent")
+
+    risk_source = _mapping(source.get("risk"))
+    risk_state = _enum(risk_source, "state", _RISK_STATES)
+    risk_date = risk_source.get("date")
+    if risk_date is not None and (
+        not isinstance(risk_date, str) or not _DATE_PATTERN.fullmatch(risk_date)
+    ):
+        raise SnapshotValidationError("risk date rejected")
+    daily_loss = _number(risk_source, "daily_loss_usdt", nullable=True)
+    risk_fresh = _boolean(risk_source, "fresh")
+    if daily_loss is not None and daily_loss < 0:
+        raise SnapshotValidationError("negative loss rejected")
+    if risk_state == "UNAVAILABLE":
+        if risk_date is not None or daily_loss is not None or risk_fresh:
+            raise SnapshotValidationError("unavailable risk state is inconsistent")
+    elif risk_date is None or daily_loss is None or risk_fresh != (risk_state == "CURRENT"):
+        raise SnapshotValidationError("risk state is inconsistent")
+    risk = {
+        "state": risk_state,
+        "date": risk_date,
+        "daily_loss_usdt": daily_loss,
+        "fresh": risk_fresh,
+    }
+
+    readiness_source = _mapping(source.get("readiness"))
+    readiness = {
+        "evidence_state": _enum(readiness_source, "evidence_state", _EVIDENCE_STATES),
+        "verdict": _enum(readiness_source, "verdict", _READINESS_VERDICTS),
+        "stage": _enum(readiness_source, "stage", _PROMOTION_STAGES),
+        "blocker_count": _bounded_int(readiness_source, "blocker_count", maximum=999),
+        "human_approval_required": _boolean(readiness_source, "human_approval_required"),
+        "production_enabled": _boolean(readiness_source, "production_enabled"),
+    }
+    if not readiness["human_approval_required"] or readiness["production_enabled"]:
+        raise SnapshotValidationError("readiness safety invariant rejected")
+
+    warnings_source = source.get("warnings")
+    if not isinstance(warnings_source, list) or len(warnings_source) > 20:
+        raise SnapshotValidationError("warning list rejected")
+    if any(not isinstance(item, str) or item not in _WARNINGS for item in warnings_source):
+        raise SnapshotValidationError("warning code rejected")
+    warnings = list(dict.fromkeys(warnings_source))
+    if len(warnings) != len(warnings_source):
+        raise SnapshotValidationError("duplicate warning rejected")
+
+    data_state = _enum(source, "data_state", _DATA_STATES)
+    if not ledger["available"] and data_state != "UNAVAILABLE":
+        raise SnapshotValidationError("data state is inconsistent")
+    if warnings and data_state == "OK":
+        raise SnapshotValidationError("warning state is inconsistent")
+
+    return (
+        {
+            "schema_version": SNAPSHOT_SCHEMA_VERSION,
+            "generated_at_utc": generated,
+            "data_state": data_state,
+            "environment": _enum(source, "environment", _ENVIRONMENTS),
+            "production_enabled": False,
+            "actions_enabled": False,
+            "runner": runner,
+            "watchdog": watchdog,
+            "ledger": ledger,
+            "risk": risk,
+            "readiness": readiness,
+            "warnings": warnings,
+        },
+        generated_dt,
+    )
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant rejected: {value}")
+
+
+def _load_snapshot(
+    path: str | os.PathLike[str],
+    *,
+    max_bytes: int,
+    max_age_seconds: int,
+    now: datetime | None = None,
+) -> SnapshotView:
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            raw = handle.read(max_bytes + 1)
+    except (OSError, UnicodeError) as exc:
+        raise SnapshotValidationError("snapshot unavailable") from exc
+    if len(raw.encode("utf-8")) > max_bytes:
+        raise SnapshotValidationError("snapshot too large")
+    try:
+        parsed = json.loads(raw, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise SnapshotValidationError("snapshot JSON rejected") from exc
+    payload, generated = _sanitize_snapshot(parsed)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    age = (current - generated).total_seconds()
+    fresh = -30.0 <= age <= max_age_seconds
+    payload["snapshot_fresh"] = fresh
+    return SnapshotView(payload=payload, fresh=fresh)
+
+
+def _auth_configuration_valid(app: Flask) -> bool:
+    user = app.config.get("DASH_USER")
+    password_hash = app.config.get("DASH_PASSWORD_HASH")
+    if not isinstance(user, str) or not 1 <= len(user) <= 128:
+        return False
+    if not isinstance(password_hash, str) or not 1 <= len(password_hash) <= 512:
+        return False
+    parts = password_hash.split("$")
+    return len(parts) == 3 and (
+        parts[0].startswith("scrypt:") or parts[0].startswith("pbkdf2:")
+    )
+
+
+def _unauthorized() -> Response:
+    response = jsonify(status="authentication_required")
+    response.status_code = 401
+    response.headers["WWW-Authenticate"] = 'Basic realm="BitMexBot Operator", charset="UTF-8"'
+    return response
+
+
+def _service_unavailable() -> tuple[Response, int]:
+    return jsonify(status="unavailable"), 503
+
+
+def _require_basic_auth(view: F) -> F:
+    @wraps(view)
+    def wrapped(*args: Any, **kwargs: Any) -> Response | str:
+        if not _auth_configuration_valid(current_app):
+            return _service_unavailable()
+        auth = request.authorization
+        if auth is None or str(auth.type).lower() != "basic":
+            return _unauthorized()
+        supplied_user = auth.username or ""
+        supplied_password = auth.password or ""
+        if len(supplied_user) > 128 or len(supplied_password) > 1024:
+            return _unauthorized()
+        expected_user = current_app.config["DASH_USER"]
+        username_ok = hmac.compare_digest(
+            supplied_user.encode("utf-8"), expected_user.encode("utf-8")
+        )
+        try:
+            password_ok = check_password_hash(
+                current_app.config["DASH_PASSWORD_HASH"], supplied_password
+            )
+        except (TypeError, ValueError):  # agent-quality: allow: malformed hashes fail closed as service unavailable
+            return _service_unavailable()
+        if not (username_ok and password_ok):
+            return _unauthorized()
+        return view(*args, **kwargs)
+
+    return wrapped  # type: ignore[return-value]
+
+
+def _snapshot_from_app(app: Flask) -> SnapshotView:
+    max_bytes = _positive_int(app.config.get("SNAPSHOT_MAX_BYTES"))
+    max_age = _positive_int(app.config.get("SNAPSHOT_MAX_AGE_SECONDS"))
+    path = app.config.get("SNAPSHOT_PATH")
+    if max_bytes is None or max_age is None or not isinstance(path, (str, os.PathLike)):
+        raise SnapshotValidationError("dashboard configuration rejected")
+    return _load_snapshot(path, max_bytes=max_bytes, max_age_seconds=max_age)
+
+
+def create_app(config: Mapping[str, Any] | None = None) -> Flask:
+    app = Flask(__name__, static_folder=None)
+    app.config.from_mapping(
+        DASH_USER=os.environ.get("DASH_USER", ""),
+        DASH_PASSWORD_HASH=os.environ.get("DASH_PASSWORD_HASH", ""),
+        SNAPSHOT_PATH=os.environ.get("DASH_SNAPSHOT_PATH", DEFAULT_SNAPSHOT_PATH),
+        SNAPSHOT_MAX_AGE_SECONDS=os.environ.get(
+            "DASH_SNAPSHOT_MAX_AGE_SECONDS", str(DEFAULT_SNAPSHOT_MAX_AGE_SECONDS)
+        ),
+        SNAPSHOT_MAX_BYTES=os.environ.get(
+            "DASH_SNAPSHOT_MAX_BYTES", str(DEFAULT_SNAPSHOT_MAX_BYTES)
+        ),
+        JSON_SORT_KEYS=True,
+    )
+    if config:
+        app.config.update(config)
+
+    @app.before_request
+    def get_only() -> tuple[Response, int] | None:
+        if request.method != "GET":
+            return jsonify(status="method_not_allowed"), 405
+        return None
+
+    @app.after_request
+    def security_headers(response: Response) -> Response:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["Content-Security-Policy"] = _CSP
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = (
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), "
+            "microphone=(), payment=(), usb=()"
+        )
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+        response.headers["Vary"] = "Authorization"
+        response.headers.pop("Access-Control-Allow-Origin", None)
+        return response
+
+    @app.errorhandler(404)
+    def not_found(_error: Any) -> tuple[Response, int]:
+        return jsonify(status="not_found"), 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(_error: Any) -> tuple[Response, int]:
+        return jsonify(status="method_not_allowed"), 405
+
+    @app.get("/healthz", provide_automatic_options=False)
+    def healthz() -> Response:
+        return jsonify(status="ok")
+
+    @app.get("/readyz", provide_automatic_options=False)
+    def readyz() -> tuple[Response, int] | Response:
+        if not _auth_configuration_valid(app):
+            return jsonify(status="unready"), 503
+        try:
+            snapshot = _snapshot_from_app(app)
+        except SnapshotValidationError:  # agent-quality: allow: health endpoint intentionally exposes only generic unready state
+            return jsonify(status="unready"), 503
+        if not snapshot.fresh or snapshot.payload["data_state"] == "UNAVAILABLE":
+            return jsonify(status="unready"), 503
+        return jsonify(status="ready")
+
+    @app.get("/api/v1/status", provide_automatic_options=False)
+    @_require_basic_auth
+    def status_api() -> tuple[Response, int] | Response:
+        try:
+            snapshot = _snapshot_from_app(app)
+        except SnapshotValidationError:  # agent-quality: allow: public API intentionally exposes only generic unavailable state
+            return _service_unavailable()
+        return jsonify(snapshot.payload)
+
+    @app.get("/", provide_automatic_options=False)
+    @_require_basic_auth
+    def index() -> tuple[Response, int] | str:
+        try:
+            snapshot = _snapshot_from_app(app)
+        except SnapshotValidationError:  # agent-quality: allow: public page intentionally exposes only generic unavailable state
+            return _service_unavailable()
+        return render_template_string(
+            _HTML,
+            style=_STYLE,
+            snapshot=snapshot.payload,
+            snapshot_fresh=snapshot.fresh,
+        )
+
+    return app
+
+
+app = create_app()

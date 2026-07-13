@@ -25,6 +25,7 @@ from bitmex_client import (
     get_client,
 )
 from execution_lock import ExecutionLockError, exclusive_execution_lock
+from execution_reconciler import reconcile_exit_from_exchange
 from execution_safety import (
     AmbiguousCreateUnresolved,
     bounded_ioc_limit_price,
@@ -42,6 +43,7 @@ from trade_ledger import (
     DB_PATH,
     UNIT_MODEL,
     LedgerError,
+    close_intent_from_events,
     record_execution_evidence,
     register_intent,
     transition_intent,
@@ -983,6 +985,104 @@ def _halt(
     )
 
 
+def _prove_protective_orders_terminal(
+    exchange: Any,
+    row: Mapping[str, Any],
+) -> None:
+    """Prove every durable protective leg terminal after a flat position."""
+
+    legs = [
+        (
+            "protective stop",
+            row.get("stop_order_id"),
+            row.get("stop_client_order_id"),
+        )
+    ]
+    if row.get("target_order_id") is not None:
+        legs.append(
+            (
+                "take-profit sibling",
+                row.get("target_order_id"),
+                row.get("target_client_order_id"),
+            )
+        )
+    for label, order_id, client_id in legs:
+        if order_id is None or client_id is None:
+            raise OrderExecutionError(f"{label} lacks a durable order reference")
+        current: Mapping[str, Any] | None = None
+        try:
+            attest_testnet_exchange(exchange)
+            fetched = exchange.fetch_order(str(order_id), SYMBOL)
+            if isinstance(fetched, Mapping):
+                current = fetched
+        except Exception:  # agent-quality: allow: deterministic client-ID lookup is the explicit fallback
+            attest_testnet_exchange(exchange)
+            current = find_order_by_client_id(
+                exchange,
+                str(client_id),
+                symbol=SYMBOL,
+            )
+        if current is None:
+            raise OrderExecutionError(f"{label} is not visible for terminal proof")
+        info = current.get("info")
+        if not isinstance(info, Mapping):
+            raise OrderExecutionError(f"{label} omitted native order identity")
+        if (
+            _order_id(current) != str(order_id)
+            or str(info.get("orderID", "")) != str(order_id)
+            or current.get("clientOrderId") != str(client_id)
+            or info.get("clOrdID") != str(client_id)
+            or current.get("symbol") != SYMBOL
+            or info.get("symbol") != "XBTUSDT"
+        ):
+            raise OrderExecutionError(
+                f"{label} does not match its durable exchange references"
+            )
+        classification = classify_order(current)
+        if not classification.terminal:
+            _, classification = _cancel_order_to_terminal(
+                exchange,
+                current,
+                str(client_id),
+                label=label,
+            )
+        if not classification.terminal:
+            raise OrderExecutionError(f"{label} is not terminal")
+
+
+def _reconcile_flat_exit(
+    exchange: Any,
+    row: Mapping[str, Any],
+    *,
+    ledger_path: str,
+    prove_protective_orders: bool,
+    final_status: str = "CLOSED",
+    halt_reason: str | None = None,
+) -> dict[str, Any]:
+    """Close one flat durable intent only from stable native executions."""
+
+    if prove_protective_orders:
+        _prove_protective_orders_terminal(exchange, row)
+    _confirm_flat(exchange)
+    _assert_no_open_orders(exchange)
+    attributed = reconcile_exit_from_exchange(
+        exchange,
+        row,
+        attempts=RECONCILE_ATTEMPTS + 1,
+        delay_seconds=RECONCILE_DELAY_SECONDS,
+    )
+    _confirm_flat(exchange)
+    _assert_no_open_orders(exchange)
+    return close_intent_from_events(
+        str(row["decision_key"]),
+        expected_statuses={str(row["status"])},
+        events=attributed.events,
+        final_status=final_status,
+        halt_reason=halt_reason,
+        db_path=ledger_path,
+    )
+
+
 def _emergency_close(
     exchange: Any,
     *,
@@ -1040,7 +1140,7 @@ def _emergency_close(
         if not close_state.is_filled:
             raise OrderExecutionError("emergency Close did not prove a full fill")
         close_order_id = _order_id(close_order)
-        record_execution_evidence(
+        reconciliation_row = record_execution_evidence(
             decision_key,
             expected_statuses={current_status},
             updates={
@@ -1050,7 +1150,30 @@ def _emergency_close(
             db_path=ledger_path,
         )
         _confirm_flat(exchange)
-        halt_reason = f"{reason}; emergency Close repeatedly verified account flat"
+        try:
+            accounting_halt_reason = (
+                f"{reason}; emergency Close was repeatedly verified flat and "
+                "accounted from stable native executions; manual review remains required"
+            )
+            reconciled = _reconcile_flat_exit(
+                exchange,
+                reconciliation_row,
+                ledger_path=ledger_path,
+                prove_protective_orders=False,
+                final_status="HALTED_MANUAL",
+                halt_reason=accounting_halt_reason,
+            )
+        except Exception as reconciliation_exc:  # agent-quality: allow: flat but incomplete accounting remains a manual halt
+            halt_reason = (
+                f"{reason}; emergency Close repeatedly verified account flat, but "
+                "execution accounting could not be completed: "
+                f"{_safe_error(reconciliation_exc)}"
+            )
+        else:
+            return (
+                f"{accounting_halt_reason}; exit was reconciled as "
+                f"{reconciled['exit_reason']}"
+            )
     except Exception as exc:  # agent-quality: allow: failure is persisted as HALTED_MANUAL below
         try:
             _confirm_flat(exchange)
@@ -1300,12 +1423,27 @@ def _reconcile_open_intent_locked(
     if status in {"PROTECTED", "PROTECTED_NO_TP"}:
         position = _stable_position(exchange)
         if position.contracts == 0:
-            reason = (
-                "protected position is now flat; fill, fee, funding, sibling-order "
-                "cancellation, and exit accounting require reconciliation"
-            )
-            _halt(decision_key, status, reason, ledger_path)
-            return {"status": "manual_halt", "reason": reason}
+            try:
+                closed = _reconcile_flat_exit(
+                    exchange,
+                    row,
+                    ledger_path=ledger_path,
+                    prove_protective_orders=True,
+                )
+            except Exception as exc:  # agent-quality: allow: incomplete exit evidence is persisted as a manual halt
+                reason = (
+                    "protected position is flat but complete exit reconciliation "
+                    f"failed: {_safe_error(exc)}"
+                )
+                _halt(decision_key, status, reason, ledger_path)
+                return {"status": "manual_halt", "reason": reason}
+            return {
+                "status": "reconciled_flat",
+                "reason": (
+                    f"protected exit reconciled as {closed['exit_reason']} from "
+                    "stable native execution evidence"
+                ),
+            }
         try:
             _verify_existing_protection(exchange, row, instrument)
         except Exception as exc:  # agent-quality: allow: broken protection triggers conservative flattening

@@ -1,0 +1,217 @@
+name: bitmexbot-safe
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-runtime-hardening: &runtime-hardening
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+  restart: unless-stopped
+  logging: *default-logging
+
+services:
+  secure-dns:
+    image: bitmexbot-dns:20260714
+    build:
+      context: .
+      dockerfile: Dockerfile.dns
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /run:rw,noexec,nosuid,nodev,size=8m,mode=0755
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=1777
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.50
+    logging: *default-logging
+    networks:
+      bitmexbot:
+        ipv4_address: 10.254.53.53
+
+  ledger-init:
+    image: bitmexbot-runner:20260714
+    command:
+      - python
+      - trade_ledger.py
+      - --init
+      - --path
+      - /app/data/trades_v2.db
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    restart: "no"
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.50
+    logging: *default-logging
+    volumes:
+      - bitmexbot-data:/app/data
+
+  runner:
+    <<: *runtime-hardening
+    image: bitmexbot-runner:20260714
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env.runner
+        format: raw
+    depends_on:
+      secure-dns:
+        condition: service_healthy
+      ledger-init:
+        condition: service_completed_successfully
+    networks:
+      bitmexbot:
+    dns:
+      - 10.254.53.53
+    pids_limit: 128
+    mem_limit: 1536m
+    cpus: 2.00
+    volumes:
+      - bitmexbot-data:/app/data
+      - bitmexbot-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py", "runner"]
+      interval: 60s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    stop_grace_period: 30s
+
+  watchdog:
+    <<: *runtime-hardening
+    profiles: ["watchdog"]
+    image: bitmexbot-runner:20260714
+    command: ["python", "exchange_watchdog.py"]
+    env_file:
+      - path: .env.watchdog
+        format: raw
+        required: false
+    depends_on:
+      secure-dns:
+        condition: service_healthy
+      ledger-init:
+        condition: service_completed_successfully
+    networks:
+      bitmexbot:
+    dns:
+      - 10.254.53.53
+    pids_limit: 96
+    mem_limit: 256m
+    cpus: 0.75
+    volumes:
+      - watchdog-status:/app/data
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py", "watchdog"]
+      interval: 20s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  snapshot:
+    <<: *runtime-hardening
+    image: bitmexbot-runner:20260714
+    command:
+      - python
+      - operator_snapshot.py
+      - --heartbeat
+      - /app/data/runner_status.json
+      - --watchdog
+      - /watchdog/watchdog_status.json
+      - --output
+      - /snapshot/operator_status.json
+      - --poll-seconds
+      - "15"
+    environment:
+      BITMEX_SNAPSHOT_STATUS_PATH: /snapshot/operator_status.json
+    depends_on:
+      ledger-init:
+        condition: service_completed_successfully
+      runner:
+        condition: service_started
+    volumes:
+      - bitmexbot-data:/app/data:ro
+      - watchdog-status:/watchdog:ro
+      - dashboard-snapshot:/snapshot
+    network_mode: none
+    pids_limit: 64
+    mem_limit: 384m
+    cpus: 0.75
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py", "snapshot"]
+      interval: 20s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  dashboard:
+    image: bitmexbot-dashboard:20260714
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    env_file:
+      - path: .env.dashboard
+        format: raw
+    environment:
+      DASH_SNAPSHOT_PATH: /snapshot/operator_status.json
+    depends_on:
+      snapshot:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    restart: unless-stopped
+    pids_limit: 96
+    mem_limit: 256m
+    cpus: 0.75
+    logging: *default-logging
+    ports:
+      - "127.0.0.1:5000:8080"
+    volumes:
+      - dashboard-snapshot:/snapshot:ro
+    networks:
+      dashboard:
+
+networks:
+  bitmexbot:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.254.53.0/24
+  dashboard:
+    driver: bridge
+    internal: true
+
+volumes:
+  bitmexbot-data:
+    name: bitmexbot-safe-data
+  bitmexbot-logs:
+    name: bitmexbot-safe-logs
+  watchdog-status:
+    name: bitmexbot-safe-watchdog-status
+  dashboard-snapshot:
+    name: bitmexbot-safe-dashboard-snapshot

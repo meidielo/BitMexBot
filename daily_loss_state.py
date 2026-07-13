@@ -9,7 +9,15 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from trade_ledger import ACTIVE_STATUSES, ALL_STATUSES, DB_PATH, UNIT_MODEL
+from trade_ledger import (
+    ACTIVE_STATUSES,
+    ALL_STATUSES,
+    DB_PATH,
+    UNIT_MODEL,
+    LedgerError,
+    validate_execution_ledger_schema,
+    verify_terminal_execution_evidence,
+)
 
 
 DAILY_LOSS_PATH = os.path.join("data", "daily_loss.json")
@@ -25,6 +33,8 @@ def _read_only_connection(path: str) -> sqlite3.Connection:
     uri = Path(path).resolve().as_posix()
     connection = sqlite3.connect(f"file:{uri}?mode=ro", uri=True, timeout=5)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA query_only=ON")
     return connection
 
 
@@ -48,6 +58,7 @@ def refresh_daily_loss_from_ledger(
             integrity = connection.execute("PRAGMA integrity_check").fetchone()
             if not integrity or str(integrity[0]).lower() != "ok":
                 raise DailyLossStateError("versioned ledger integrity check failed")
+            validate_execution_ledger_schema(connection)
             placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
             unresolved = connection.execute(
                 "SELECT COUNT(*) FROM execution_intents "
@@ -73,10 +84,14 @@ def refresh_daily_loss_from_ledger(
                     "daily loss cannot be published from invalid ledger rows"
                 )
             rows = connection.execute(
-                "SELECT status, filled_contracts, net_pnl_usdt, updated_at_utc "
+                "SELECT * "
                 "FROM execution_intents WHERE status IN ('CLOSED', 'FAILED_FLAT')"
             ).fetchall()
-    except sqlite3.Error as exc:
+            for row in rows:
+                if int(row["filled_contracts"]) > 0:
+                    verify_terminal_execution_evidence(connection, row)
+            rows = [dict(row) for row in rows]
+    except (LedgerError, sqlite3.Error) as exc:
         raise DailyLossStateError(f"could not read versioned ledger: {exc}") from exc
 
     gross_loss = 0.0
@@ -88,16 +103,16 @@ def refresh_daily_loss_from_ledger(
             raise DailyLossStateError("filled terminal row is missing net PnL")
         try:
             net_pnl = float(row["net_pnl_usdt"])
-            updated = datetime.fromisoformat(str(row["updated_at_utc"]))
+            exited = datetime.fromisoformat(str(row["exit_time_utc"]))
         except (TypeError, ValueError) as exc:
             raise DailyLossStateError(
                 "terminal ledger row has invalid PnL or timestamp evidence"
             ) from exc
-        if not updated.tzinfo:
-            raise DailyLossStateError("terminal ledger timestamp is not timezone-aware")
+        if not exited.tzinfo:
+            raise DailyLossStateError("terminal ledger exit timestamp is not timezone-aware")
         if not (float("-inf") < net_pnl < float("inf")):
             raise DailyLossStateError("terminal ledger PnL is non-finite")
-        if updated.astimezone(timezone.utc).strftime("%Y-%m-%d") == today and net_pnl < 0:
+        if exited.astimezone(timezone.utc).strftime("%Y-%m-%d") == today and net_pnl < 0:
             gross_loss += abs(net_pnl)
 
     payload: dict[str, float | str] = {

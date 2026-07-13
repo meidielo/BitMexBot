@@ -1,0 +1,25 @@
+# App-scoped strict DNS-over-TLS resolver for the remote BitMexBot containers.
+# Plaintext UDP/TCP fallback is intentionally absent. Upstream certificate
+# names are authenticated, so an ISP DNS interception page cannot be accepted.
+resolution_type: GETDNS_RESOLUTION_STUB
+dns_transport_list:
+  - GETDNS_TRANSPORT_TLS
+tls_authentication: GETDNS_AUTHENTICATION_REQUIRED
+tls_query_padding_blocksize: 128
+edns_client_subnet_private: 1
+round_robin_upstreams: 1
+idle_timeout: 9000
+tls_connection_retries: 2
+timeout: 5000
+listen_addresses:
+  - 0.0.0.0@53
+
+upstream_recursive_servers:
+  - address_data: 1.1.1.1
+    tls_auth_name: "cloudflare-dns.com"
+  - address_data: 1.0.0.1
+    tls_auth_name: "cloudflare-dns.com"
+  - address_data: 9.9.9.9
+    tls_auth_name: "dns.quad9.net"
+  - address_data: 149.112.112.112
+    tls_auth_name: "dns.quad9.net"

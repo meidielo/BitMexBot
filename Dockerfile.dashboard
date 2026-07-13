@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.7
+FROM python:3.12.13-slim-bookworm@sha256:8a7e7cc04fd3e2bd787f7f24e22d5d119aa590d429b50c95dfe12b3abe52f48b
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DASH_SNAPSHOT_PATH=/snapshot/operator_status.json \
+    DASH_SNAPSHOT_MAX_AGE_SECONDS=120 \
+    DASH_SNAPSHOT_MAX_BYTES=262144
+
+WORKDIR /app
+
+RUN groupadd --system --gid 10001 dashboard \
+    && useradd --system --uid 10001 --gid dashboard --home-dir /nonexistent \
+       --shell /usr/sbin/nologin dashboard \
+    && mkdir --mode=0750 /snapshot \
+    && chown dashboard:dashboard /snapshot
+
+COPY requirements-dashboard.txt /app/requirements-dashboard.txt
+RUN python -m pip install --requirement /app/requirements-dashboard.txt
+
+COPY --chown=dashboard:dashboard dashboard.py /app/dashboard.py
+
+USER 10001:10001
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import json,urllib.request; response=urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3); data=json.load(response); raise SystemExit(0 if response.status == 200 and data == {'status':'ready'} else 1)"]
+
+CMD ["gunicorn", "--no-control-socket", "--bind=0.0.0.0:8080", "--workers=2", "--threads=2", "--timeout=30", "--graceful-timeout=20", "--keep-alive=5", "--limit-request-line=2048", "--limit-request-fields=50", "--access-logfile=-", "--error-logfile=-", "dashboard:app"]

@@ -63,7 +63,11 @@ PnL and sample statistics are excluded from readiness evidence.
 | Stop placement failure | Attempt idempotent reduce-only emergency Close, verify flat when possible, then halt for reconciliation | Implemented and tested |
 | Concurrent runners or intents | Non-blocking thread/OS file lock plus a SQLite uniqueness constraint for one unresolved durable intent | Implemented and tested |
 | Crash between decisions and orders | Register intent before submission; atomic versioned lifecycle transitions; reconcile the unresolved intent before a new signal | Implemented and tested |
-| Stale or corrupt daily loss | Rebuild atomically from terminal v2 rows; refuse publication while any intent is unresolved | Implemented and tested |
+| Stale or corrupt daily loss | Rebuild atomically only after revalidating the ledger schema, terminal provenance, event accounting, and combined evidence hash; refuse publication while any intent is unresolved | Implemented and tested |
+| Flat position with incomplete exit evidence | Prove protective siblings terminal, re-prove flat/no open orders, read paginated native Testnet execution history twice without change, attribute exact entry/exit fills, fees, funding, and native `realisedPnl`, cross-check independently calculated net PnL, then append events and close atomically; any ambiguity halts | Implemented and tested |
+| REST process blind spot | Independent authenticated Testnet WebSocket watchdog for order, position, execution, and margin state; no order/cancel/mainnet capability; stale state is explicit | Implemented and tested |
+| WebSocket credential forwarding | Reject every authenticated WebSocket redirect before aiohttp can reuse custom BitMEX auth headers at another origin | Implemented and tested |
+| Dashboard credential or data overexposure | One-way sanitized snapshot, Basic auth behind private Tailscale HTTPS, no control routes, and dashboard image/volume isolation from keys, ledger, logs, source, and Docker socket | Implemented and tested |
 | False readiness from legacy history | Disable application writes to the legacy database and exclude it from audit evidence; the file itself is not filesystem read-only | Implemented and tested |
 | Accidental automated live switch | Promotion evaluator always returns `production_enabled=false`; no authenticated mainnet client exists, while the separate mainnet client is public-data-only | Implemented and tested |
 
@@ -107,7 +111,7 @@ executions. A timeout is not proof that submission failed. The bot queries by
 the deterministic ID before creation and again after ambiguous network errors.
 If existence still cannot be proven, automation halts.
 
-### Restart reconciliation stops at manual exit accounting
+### Restart reconciliation requires stable native exit accounting
 
 Before a new decision, the runner reads the v2 ledger. It allows no more than
 one unresolved intent and holds a process/OS execution lock while repairing or
@@ -119,15 +123,20 @@ to flatten and halts.
 
 Unresolved entry, paused, stop-only, and managed-position states are checked on
 a five-second REST safety cadence. A `failed` or `manual_halt` result stops the
-runner immediately. This narrows the monitoring gap but does not replace the
-independent WebSocket watchdog and paging path still required for real funds.
+runner immediately. The independent WebSocket watchdog narrows the monitoring
+gap further, but its alert delivery, operator response, and host-failover paths
+still require recorded drills before any real-funds review.
 
-When a protected intent is found flat, the runner does not infer a complete
-exit. It enters manual halt because post-exit sibling-cancellation verification,
-exact exit fills, fees, funding, exit reason, and realized PnL still require
-operator reconciliation. Native OCO is configured; the missing control is
-independent post-exit verification and full accounting. This gap is a primary
-reason the bot is not suitable for unattended real-funds operation.
+When a protected intent is found flat, the runner proves both durable
+protective legs terminal, rechecks account-wide flat and open-order state, and
+queries paginated native Testnet execution history. The exact attributable
+entry, exit, fee, and funding evidence must remain unchanged across two reads.
+It is then normalized into an append-only event table and committed atomically
+with the terminal ledger transition. Mixed accounts, missing or contradictory
+IDs, wrong sides, quantity mismatch, an unattributed XBTUSDT trade during the
+position lifetime, incomplete funding evidence, or unstable history causes a
+manual halt. This closes an engineering gap but does not prove mainnet fill
+quality, latency, liquidity, or strategy profitability.
 
 ### Testnet is engineering evidence only
 
@@ -199,20 +208,21 @@ client.
 
 1. **No admissible edge evidence.** The current funding hypothesis is
    regime-dependent, and the legacy sample is invalid for inference.
-2. **Exit reconciliation is incomplete.** The runner safely pauses after an
-   unresolved/protected intent, but unattended fee, funding, post-exit sibling
-   verification, and exact realized-PnL reconciliation is not complete.
-3. **No independent state channel.** Execution uses REST reconciliation. A
-   production design needs authenticated WebSocket state plus an independent
-   watchdog and paging path.
-4. **No operational evidence.** There is no completed 30-day dry run, 100-drill
+2. **No verified paging or failover evidence.** The independent WebSocket
+   watchdog and optional redacted HTTPS alert exist, but no delivery, operator
+   response, credential rotation, backup restoration, or second-host failover
+   drill has been proven.
+3. **No operational evidence.** There is no completed 30-day dry run, 100-drill
    lifecycle record, failover proof, or zero-difference reconciliation record.
-5. **No verified account hardening.** Code cannot prove MFA, IP allowlisting,
+4. **No verified account hardening.** Code cannot prove MFA, IP allowlisting,
    least-privilege key scope, host encryption, secret-manager use, or key
    rotation.
-6. **No production deployment boundary.** This is intentional. A future
+5. **No production deployment boundary.** This is intentional. A future
    production adapter must be a separately reviewed component with an explicit
    human-controlled release boundary.
+6. **Promotion evidence provenance is not authenticated.** The evaluator
+   validates fields and thresholds but does not cryptographically prove that
+   the reported research runs and drills occurred.
 7. **Tax and regulatory handling remains an operator duty.** Australian users
    should retain exchange records, timestamps, purpose, AUD values, costs, and
    other records required for their circumstances and obtain professional

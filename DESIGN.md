@@ -79,11 +79,17 @@ the daily cap.
 - Missing stop proof triggers an emergency reduce-only close attempt and manual halt.
 - Restart checks the single unresolved v2 intent before a new signal. Unknown
   entry exposure is reconciled or conservatively closed; existing protection
-  is re-verified. A protected intent found flat still enters manual halt because
-  post-exit sibling-cancellation verification, fill, fee, funding, and
-  realized-PnL exit accounting is not automated end to end.
+  is re-verified. A protected intent found flat closes only after sibling
+  terminal proof, account-wide flat/no-order proof, and stable native execution
+  history exactly reconcile entry and exit fills, fees, funding, identifiers,
+  sides, timestamps, account, combined evidence hash, and native `realisedPnl`
+  against independently calculated net PnL. Any mismatch enters manual halt.
 - Unresolved and managed execution states use a five-second REST watchdog
   cadence; fatal execution states stop the process immediately.
+- An independent authenticated Testnet WebSocket watchdog observes private
+  state but has no order, cancellation, dead-man switch, or mainnet capability.
+- The dashboard receives only a one-way sanitized snapshot. It has no exchange
+  credentials, ledger, logs, trading code, control route, or Docker socket.
 - Legacy `data/trades.db` remains a normal filesystem file for compatibility,
   but application trade/exit writes are disabled and its rows are excluded
   from readiness evidence.
@@ -109,12 +115,17 @@ risk.py                   # unit-aware fail-closed risk filter
 execution_lock.py         # thread and OS singleton execution authority
 execution_safety.py       # idempotency, IOC price, order classification
 order_manager.py          # bounded entry and fill-anchored protection
-trade_ledger.py           # versioned durable execution state
-daily_loss_state.py       # atomic loss state from reconciled v2 rows
+trade_ledger.py           # versioned state plus append-only execution evidence
+execution_reconciler.py   # stable native entry/exit/fee/funding/PnL attribution
+daily_loss_state.py       # revalidated atomic loss state from reconciled v2 rows
 logger.py                 # legacy reads/PnL compatibility; legacy writes disabled
 monitor.py                # legacy dashboard summary only
 main.py                   # completed-candle Testnet orchestrator
 promotion.py              # evidence stages; never enables production
+runtime_status.py         # atomic sanitized runner heartbeat
+exchange_watchdog.py      # independent read-only private WebSocket state
+operator_snapshot.py      # one-way dashboard snapshot exporter
+healthcheck.py            # bounded container freshness probes
 
 # Telemetry + tracking
 condition_logger.py       # per-condition pass/fail logging every loop
@@ -129,7 +140,7 @@ backtest.py               # V2 funding rate backtest
 exec_simulator.py         # 1m micro-execution simulator
 
 # Dashboard + utilities
-dashboard.py              # Flask read-only web dashboard
+dashboard.py              # authenticated Flask read-only web dashboard
 audit.py                  # v2 ledger and promotion no-go audit
 universe_builder.py       # survivorship-bias-free asset universe
 weekly_report.sh          # weekly status report (cron, every Mon 09:00)
@@ -181,11 +192,18 @@ Copy-Item .env.example .env
 therefore available after the development install, but unittest discovery and
 the two direct scripts above remain the required repository checks.
 
-## Services (systemd)
+## Remote services
+
+The remote Coolify host uses the hardened Compose stack. The dashboard stays on
+remote loopback and is published privately through Tailscale Serve HTTPS.
+
 ```bash
-sudo systemctl status bitmexbot.service   # trading bot
-sudo systemctl status bitmexdash.service  # web dashboard
+docker compose -f compose.remote.yml ps
+tailscale serve status
 ```
+
+See `docs/REMOTE_DEPLOYMENT.md`. No service in this stack adds authenticated
+mainnet order authority.
 
 ## Phase Checklist
 - [x] Phase 1: Connect to testnet, fetch candles, print to terminal

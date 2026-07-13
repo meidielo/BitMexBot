@@ -1,0 +1,25 @@
+# The runner image receives source code but never local credentials, ledgers,
+# logs, Git history, caches, research artifacts, or operator files.
+.git
+.github
+.claude
+.pytest_cache
+__pycache__
+*.py[cod]
+.env
+.env.*
+!.env.example
+.credentials
+data
+logs
+security-triage
+tasks
+docs
+AGENTS.md*
+*.db
+*.sqlite3
+*.md
+Dockerfile.dashboard
+Dockerfile.dns
+deploy
+test_*.py

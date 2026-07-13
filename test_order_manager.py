@@ -8,7 +8,7 @@ import ccxt
 
 import order_manager
 from instrument import XBTUSDTInstrument
-from trade_ledger import get_intent
+from trade_ledger import get_intent, list_execution_events
 
 
 def instrument():
@@ -51,6 +51,39 @@ def corrupt_client_order_id(order, mode):
     else:
         raise AssertionError(f"unsupported corruption mode {mode}")
     return order
+
+
+def native_trade(
+    exec_id,
+    order_id,
+    client_order_id,
+    side,
+    quantity,
+    price,
+    commission,
+    timestamp,
+    *,
+    realised_pnl=None,
+):
+    if realised_pnl is None:
+        realised_pnl = -commission
+    return {
+        "execID": exec_id,
+        "orderID": order_id,
+        "clOrdID": client_order_id,
+        "clOrdLinkID": None,
+        "account": 42,
+        "symbol": "XBTUSDT",
+        "execType": "Trade",
+        "ordStatus": "Filled",
+        "side": side,
+        "lastQty": quantity,
+        "lastPx": price,
+        "execComm": commission,
+        "execCommCcy": "USDt",
+        "realisedPnl": realised_pnl,
+        "transactTime": timestamp,
+    }
 
 
 class FakeExchange:
@@ -318,6 +351,19 @@ class FakeExchange:
         return dict(order)
 
 
+class HistoryExchange(FakeExchange):
+    def __init__(self, *args, history=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.history = list(history or [])
+        self.history_calls = []
+
+    def private_get_execution_tradehistory(self, params):
+        self.history_calls.append(dict(params))
+        start = int(params["start"])
+        count = int(params["count"])
+        return [dict(row) for row in self.history[start : start + count]]
+
+
 class OrderManagerTests(unittest.TestCase):
     now_ms = 1_800_001
     decision_key = "BTC/USDT:USDT|15m|1800000|LONG"
@@ -364,6 +410,44 @@ class OrderManagerTests(unittest.TestCase):
             exchange=exchange,
             ledger_path=self.db_path,
         )
+
+    def fill_target_and_flatten(self, exchange, row):
+        target = exchange.orders[row["target_order_id"]]
+        target["status"] = "closed"
+        target["filled"] = 1_000
+        target["remaining"] = 0
+        target["average"] = 60_900.0
+        target["info"]["ordStatus"] = "Filled"
+        target["info"]["cumQty"] = 1_000
+        target["info"]["leavesQty"] = 0
+        target["info"]["avgPx"] = 60_900.0
+        exchange.position_contracts = 0
+        exchange.position_side = None
+
+    def complete_target_history(self, row):
+        return [
+            native_trade(
+                "entry-exec-1",
+                row["entry_order_id"],
+                row["entry_client_order_id"],
+                "Buy",
+                1_000,
+                60_000.0,
+                30_000,
+                "1970-01-01T00:30:00.100Z",
+            ),
+            native_trade(
+                "target-exec-1",
+                row["target_order_id"],
+                row["target_client_order_id"],
+                "Sell",
+                1_000,
+                60_900.0,
+                30_450,
+                "1970-01-01T00:31:00.000Z",
+                realised_pnl=869_550,
+            ),
+        ]
 
     def test_rejects_non_testnet_before_exchange_use(self):
         exchange = FakeExchange()
@@ -642,6 +726,63 @@ class OrderManagerTests(unittest.TestCase):
         self.assertEqual(row["status"], "HALTED_MANUAL")
         self.assertIsNotNone(row["exit_order_id"])
         self.assertIn("repeatedly verified account flat", row["halt_reason"])
+
+    def test_reconciled_emergency_close_keeps_atomic_manual_review_gate(self):
+        class EmergencyHistoryExchange(HistoryExchange):
+            def private_get_execution_tradehistory(self, params):
+                entry = next(
+                    order
+                    for order in self.orders.values()
+                    if order["info"]["timeInForce"] == "ImmediateOrCancel"
+                )
+                emergency = next(
+                    order
+                    for order in self.orders.values()
+                    if order["info"]["ordType"] == "Market"
+                )
+                self.history = [
+                    native_trade(
+                        "entry-exec-1",
+                        entry["id"],
+                        entry["clientOrderId"],
+                        "Buy",
+                        1_000,
+                        60_000.0,
+                        30_000,
+                        "1970-01-01T00:30:00.100Z",
+                    ),
+                    native_trade(
+                        "emergency-exec-1",
+                        emergency["id"],
+                        emergency["clientOrderId"],
+                        "Sell",
+                        1_000,
+                        60_000.0,
+                        30_000,
+                        "1970-01-01T00:30:01.000Z",
+                    ),
+                ]
+                return super().private_get_execution_tradehistory(params)
+
+        exchange = EmergencyHistoryExchange(stop_fail=True)
+
+        result = self.execute(exchange)
+
+        self.assertEqual(result["status"], "manual_halt")
+        row = get_intent(self.decision_key, self.db_path)
+        self.assertEqual(row["status"], "HALTED_MANUAL")
+        self.assertEqual(row["closed_contracts"], 1_000)
+        self.assertEqual(row["exit_reason"], "emergency_close")
+        self.assertEqual(len(list_execution_events(self.decision_key, self.db_path)), 2)
+        self.assertIn("manual review remains required", row["halt_reason"])
+
+        creates = len([call for call in exchange.calls if call[0] == "create_order"])
+        restarted = self.execute(exchange)
+        self.assertEqual(restarted["status"], "manual_halt")
+        self.assertEqual(
+            len([call for call in exchange.calls if call[0] == "create_order"]),
+            creates,
+        )
 
     def test_target_rejection_keeps_stop_and_records_no_tp_state(self):
         exchange = FakeExchange(target_fail=True)
@@ -1137,6 +1278,74 @@ class OrderManagerTests(unittest.TestCase):
         updated = get_intent(self.decision_key, self.db_path)
         self.assertEqual(updated["status"], "HALTED_MANUAL")
         self.assertIn("non-XBTUSDT", updated["halt_reason"])
+
+    def test_restart_closes_flat_target_only_from_stable_native_history(self):
+        exchange = HistoryExchange()
+        self.assertEqual(self.execute(exchange)["status"], "placed")
+        row = get_intent(self.decision_key, self.db_path)
+        self.fill_target_and_flatten(exchange, row)
+        exchange.history = self.complete_target_history(row)
+
+        outcome = order_manager.reconcile_open_intent(
+            exchange,
+            row,
+            ledger_path=self.db_path,
+        )
+
+        self.assertEqual(outcome["status"], "reconciled_flat")
+        self.assertEqual(exchange.orders[row["stop_order_id"]]["status"], "canceled")
+        closed = get_intent(self.decision_key, self.db_path)
+        self.assertEqual(closed["status"], "CLOSED")
+        self.assertEqual(closed["exit_reason"], "take_profit")
+        self.assertEqual(closed["exit_time_utc"], "1970-01-01T00:31:00+00:00")
+        self.assertAlmostEqual(closed["gross_pnl_usdt"], 0.9)
+        self.assertAlmostEqual(closed["fees_usdt"], 0.06045)
+        self.assertAlmostEqual(closed["net_pnl_usdt"], 0.83955)
+        self.assertGreaterEqual(len(exchange.history_calls), 2)
+
+    def test_restart_flat_exit_halts_when_sibling_cannot_be_proved_terminal(self):
+        class SiblingCancelFailureExchange(HistoryExchange):
+            def cancel_order(self, order_id, symbol):
+                self.calls.append(("cancel_order", order_id, symbol))
+                raise TimeoutError("protective sibling cancel response was lost")
+
+        exchange = SiblingCancelFailureExchange()
+        self.assertEqual(self.execute(exchange)["status"], "placed")
+        row = get_intent(self.decision_key, self.db_path)
+        self.fill_target_and_flatten(exchange, row)
+        exchange.history = self.complete_target_history(row)
+
+        outcome = order_manager.reconcile_open_intent(
+            exchange,
+            row,
+            ledger_path=self.db_path,
+        )
+
+        self.assertEqual(outcome["status"], "manual_halt")
+        halted = get_intent(self.decision_key, self.db_path)
+        self.assertEqual(halted["status"], "HALTED_MANUAL")
+        self.assertIn("protective stop cancellation could not be proven terminal", halted["halt_reason"])
+        self.assertEqual(exchange.history_calls, [])
+
+    def test_restart_flat_exit_halts_when_native_exit_history_is_missing(self):
+        exchange = HistoryExchange()
+        self.assertEqual(self.execute(exchange)["status"], "placed")
+        row = get_intent(self.decision_key, self.db_path)
+        self.fill_target_and_flatten(exchange, row)
+        exchange.history = self.complete_target_history(row)[:1]
+
+        outcome = order_manager.reconcile_open_intent(
+            exchange,
+            row,
+            ledger_path=self.db_path,
+        )
+
+        self.assertEqual(outcome["status"], "manual_halt")
+        halted = get_intent(self.decision_key, self.db_path)
+        self.assertEqual(halted["status"], "HALTED_MANUAL")
+        self.assertIn("complete exit reconciliation failed", halted["halt_reason"])
+        self.assertIn("ExitEvidencePending", halted["halt_reason"])
+        self.assertGreaterEqual(len(exchange.history_calls), 2)
 
     def test_restart_reverifies_existing_protection(self):
         exchange = FakeExchange()

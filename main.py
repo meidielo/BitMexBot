@@ -29,6 +29,7 @@ from execution_safety import build_completed_candle_decision_key
 from fetch_data import fetch_ohlcv, fetch_recent_funding
 from monitor import print_summary
 from order_manager import execute_signal, reconcile_open_intent
+from runtime_status import RuntimeStatusError, write_runner_status
 from risk import validate_signal
 from signals import (
     FUNDING_24H_THRESH,
@@ -53,6 +54,17 @@ SAFETY_MONITOR_STATUSES = frozenset(
     {"managed_position", "paused", "protected_no_tp", "reconciling"}
 )
 FATAL_RUN_STATUSES = frozenset({"failed", "manual_halt"})
+
+
+def _publish_runtime_status(status: str, detail_code: str) -> None:
+    """Publish sanitized operator telemetry without affecting execution logic."""
+
+    try:
+        write_runner_status(status, detail_code=detail_code)
+    except RuntimeStatusError as exc:
+        # Heartbeat failure is visible, but never replaces the execution safety
+        # result or leaks a free-form exchange error into dashboard telemetry.
+        print(f"[WARN] Runtime heartbeat was not written: {exc}")
 
 
 class RunnerSafetyError(RuntimeError):
@@ -304,28 +316,40 @@ def _sleep_to_safety_check(loop_started: float) -> None:
 def main() -> None:
     print("BitMEXBot research runner")
     print("TESTNET ORDERS ONLY. Authenticated mainnet execution is unavailable.")
+    _publish_runtime_status("STARTING", "client_init")
     try:
         execution_exchange = get_client()
         data_exchange = get_data_client()
     except Exception as exc:
+        _publish_runtime_status("FAILED", "client_init_failed")
         raise SystemExit(f"[ABORT] Client initialization failed: {exc}") from exc
 
     try:
         while True:
             loop_started = time.time()
+            _publish_runtime_status("RUNNING", "decision_cycle")
             result = run_once(execution_exchange, data_exchange)
             timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
             print(f"[{timestamp}] {result['status']}: {result.get('reason', '')}")
             if result["status"] in FATAL_RUN_STATUSES:
+                heartbeat_status = (
+                    "MANUAL_HALT"
+                    if result["status"] == "manual_halt"
+                    else "FAILED"
+                )
+                _publish_runtime_status(heartbeat_status, result["status"])
                 raise SystemExit(
                     "[HALT] Execution state requires immediate exchange and "
                     "ledger reconciliation."
                 )
             if result["status"] in SAFETY_MONITOR_STATUSES:
+                _publish_runtime_status("PAUSED", "safety_reconciliation")
                 _sleep_to_safety_check(loop_started)
             else:
+                _publish_runtime_status("WAITING", "next_candle")
                 _sleep_to_next_bar(loop_started)
     except KeyboardInterrupt:
+        _publish_runtime_status("STOPPED", "operator_stop")
         print("\n[STOP] Runner stopped by user.")
         print_summary()
 
@@ -340,6 +364,7 @@ __all__ = [
     "_decision_key",
     "_get_open_positions",
     "_get_usdt_balances",
+    "_publish_runtime_status",
     "_reconcile_unresolved_intent",
     "_settled_funding_for_candle",
     "run_once",

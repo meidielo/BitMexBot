@@ -1,0 +1,4 @@
+*
+!Dockerfile.dns
+!deploy/
+!deploy/stubby.yml

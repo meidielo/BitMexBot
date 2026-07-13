@@ -8,8 +8,10 @@ silently become live-readiness evidence.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
+import re
 import sqlite3
 from collections.abc import Iterable, Mapping
 from contextlib import closing
@@ -20,7 +22,7 @@ from typing import Any
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DB_PATH = os.path.join(DB_DIR, "trades_v2.db")
 UNIT_MODEL = "xbtusdt-linear-metadata-v1"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 ACTIVE_STATUSES = frozenset(
     {
@@ -112,10 +114,39 @@ CREATE TABLE IF NOT EXISTS execution_intents (
 );
 """
 
+_CREATE_EVENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS execution_events (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id                 INTEGER NOT NULL,
+    exec_id                   TEXT NOT NULL UNIQUE,
+    account_id                TEXT NOT NULL,
+    native_symbol             TEXT NOT NULL CHECK(native_symbol = 'XBTUSDT'),
+    event_type                TEXT NOT NULL CHECK(event_type IN ('TRADE', 'FUNDING')),
+    event_role                TEXT NOT NULL CHECK(event_role IN ('ENTRY', 'EXIT', 'FUNDING')),
+    order_id                  TEXT,
+    client_order_id           TEXT,
+    link_id                   TEXT,
+    side                      TEXT,
+    last_qty                  INTEGER NOT NULL CHECK(last_qty >= 0),
+    last_price_usdt           REAL,
+    commission_usdt           REAL NOT NULL,
+    funding_usdt              REAL NOT NULL,
+    realised_pnl_usdt         REAL,
+    transact_time_utc         TEXT NOT NULL,
+    source_hash               TEXT NOT NULL,
+    created_at_utc            TEXT NOT NULL,
+    FOREIGN KEY(intent_id) REFERENCES execution_intents(id) ON DELETE RESTRICT
+);
+"""
+
 _SCHEMA_ADDITIONS = {
     "closed_contracts": "INTEGER NOT NULL DEFAULT 0 CHECK(closed_contracts >= 0)",
     "exit_client_order_id": "TEXT",
     "exit_order_id": "TEXT",
+    "entry_time_utc": "TEXT",
+    "exit_time_utc": "TEXT",
+    "reconciled_at_utc": "TEXT",
+    "evidence_source_hash": "TEXT",
 }
 
 _UNIQUE_ORDER_ID_FIELDS = (
@@ -126,6 +157,9 @@ _UNIQUE_ORDER_ID_FIELDS = (
     "exit_order_id",
 )
 _SINGLE_UNRESOLVED_INDEX = "ux_execution_intents_single_unresolved"
+_EVENT_INTENT_INDEX = "idx_execution_events_intent_time"
+_EVENT_NO_UPDATE_TRIGGER = "execution_events_append_only_update"
+_EVENT_NO_DELETE_TRIGGER = "execution_events_append_only_delete"
 _REQUIRED_COLUMNS = frozenset(
     {
         "id",
@@ -161,10 +195,38 @@ _REQUIRED_COLUMNS = frozenset(
         "funding_usdt",
         "net_pnl_usdt",
         "exit_reason",
+        "entry_time_utc",
+        "exit_time_utc",
+        "reconciled_at_utc",
+        "evidence_source_hash",
         "status",
         "halt_reason",
         "created_at_utc",
         "updated_at_utc",
+    }
+)
+
+_REQUIRED_EVENT_COLUMNS = frozenset(
+    {
+        "id",
+        "intent_id",
+        "exec_id",
+        "account_id",
+        "native_symbol",
+        "event_type",
+        "event_role",
+        "order_id",
+        "client_order_id",
+        "link_id",
+        "side",
+        "last_qty",
+        "last_price_usdt",
+        "commission_usdt",
+        "funding_usdt",
+        "realised_pnl_usdt",
+        "transact_time_utc",
+        "source_hash",
+        "created_at_utc",
     }
 )
 
@@ -204,6 +266,21 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "ON execution_intents((1)) "
         f"WHERE status IN ({_UNRESOLVED_STATUS_SQL})"
     )
+    conn.execute(_CREATE_EVENTS_TABLE)
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS {_EVENT_INTENT_INDEX} "
+        "ON execution_events(intent_id, transact_time_utc, exec_id)"
+    )
+    conn.execute(
+        f"CREATE TRIGGER IF NOT EXISTS {_EVENT_NO_UPDATE_TRIGGER} "
+        "BEFORE UPDATE ON execution_events BEGIN "
+        "SELECT RAISE(ABORT, 'execution_events are append-only'); END"
+    )
+    conn.execute(
+        f"CREATE TRIGGER IF NOT EXISTS {_EVENT_NO_DELETE_TRIGGER} "
+        "BEFORE DELETE ON execution_events BEGIN "
+        "SELECT RAISE(ABORT, 'execution_events are append-only'); END"
+    )
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -237,6 +314,55 @@ def _validate_schema(conn: sqlite3.Connection) -> None:
     missing_indexes = sorted(required_indexes - indexes)
     if missing_indexes:
         raise LedgerError(f"ledger schema is missing indexes: {missing_indexes}")
+
+    event_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("execution_events",),
+    ).fetchone()
+    if event_table is None:
+        raise LedgerError("ledger schema is missing execution_events")
+    event_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(execution_events)").fetchall()
+    }
+    missing_event_columns = sorted(_REQUIRED_EVENT_COLUMNS - event_columns)
+    if missing_event_columns:
+        raise LedgerError(
+            f"ledger schema is missing execution event columns: {missing_event_columns}"
+        )
+    event_indexes = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA index_list(execution_events)").fetchall()
+    }
+    if _EVENT_INTENT_INDEX not in event_indexes:
+        raise LedgerError("ledger schema is missing the execution-event intent index")
+    trigger_rows = {
+        str(row[0]): str(row[1] or "")
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()
+    }
+    required_triggers = {_EVENT_NO_UPDATE_TRIGGER, _EVENT_NO_DELETE_TRIGGER}
+    if not required_triggers <= trigger_rows.keys():
+        raise LedgerError("ledger schema is missing append-only event triggers")
+    for name, operation in (
+        (_EVENT_NO_UPDATE_TRIGGER, "UPDATE"),
+        (_EVENT_NO_DELETE_TRIGGER, "DELETE"),
+    ):
+        expected = (
+            f"CREATE TRIGGER {name} BEFORE {operation} ON execution_events BEGIN "
+            "SELECT RAISE(ABORT, 'execution_events are append-only'); END"
+        )
+        normalized_actual = re.sub(r"\s+", " ", trigger_rows[name]).strip().casefold()
+        normalized_expected = re.sub(r"\s+", " ", expected).strip().casefold()
+        if normalized_actual != normalized_expected:
+            raise LedgerError("ledger append-only event trigger definition is invalid")
+
+
+def validate_execution_ledger_schema(conn: sqlite3.Connection) -> None:
+    """Validate the complete current ledger contract on an existing connection."""
+
+    _validate_schema(conn)
 
 
 def _connect_for_registration(db_path: str) -> sqlite3.Connection:
@@ -422,6 +548,10 @@ _UPDATABLE_FIELDS = frozenset(
         "funding_usdt",
         "net_pnl_usdt",
         "exit_reason",
+        "entry_time_utc",
+        "exit_time_utc",
+        "reconciled_at_utc",
+        "evidence_source_hash",
         "halt_reason",
     }
 )
@@ -462,6 +592,19 @@ def _finite_number(value: Any, field: str) -> float:
     if not math.isfinite(normalized):
         raise LedgerError(f"{field} must be finite numeric evidence")
     return normalized
+
+
+def _utc_timestamp(value: Any, field: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise LedgerError(f"{field} must be a non-empty UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise LedgerError(f"{field} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise LedgerError(f"{field} must be timezone-aware")
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _normalize_updates(
@@ -538,8 +681,6 @@ def _normalize_updates(
     for field in _PNL_FIELDS:
         if field in changes:
             changes[field] = _finite_number(changes[field], field)
-    if "fees_usdt" in changes and changes["fees_usdt"] < 0:
-        raise LedgerError("fees_usdt must be a non-negative cost")
 
     for field in ("exit_reason", "halt_reason"):
         if field not in changes:
@@ -553,6 +694,24 @@ def _normalize_updates(
         if existing is not None and str(existing) != value:
             raise LedgerError(f"{field} is immutable once recorded")
         changes[field] = value
+
+    for field in ("entry_time_utc", "exit_time_utc", "reconciled_at_utc"):
+        if field not in changes:
+            continue
+        value = _utc_timestamp(changes[field], field)
+        existing = row[field]
+        if existing is not None and str(existing) != value:
+            raise LedgerError(f"{field} is immutable once recorded")
+        changes[field] = value
+
+    if "evidence_source_hash" in changes:
+        value = str(changes["evidence_source_hash"]).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise LedgerError("evidence_source_hash must be a SHA-256 hex digest")
+        existing = row["evidence_source_hash"]
+        if existing is not None and str(existing) != value:
+            raise LedgerError("evidence_source_hash is immutable once recorded")
+        changes["evidence_source_hash"] = value
 
     client_ids = {
         str(value)
@@ -658,6 +817,26 @@ def _require_state_evidence(status: str, values: Mapping[str, Any]) -> None:
         net_tolerance = max(1e-8, abs(expected_net) * 1e-9)
         if abs(float(values["net_pnl_usdt"]) - expected_net) > net_tolerance:
             raise LedgerError("net_pnl_usdt is inconsistent with costs and funding")
+        provenance = (
+            values["entry_time_utc"],
+            values["exit_time_utc"],
+            values["reconciled_at_utc"],
+            values["evidence_source_hash"],
+        )
+        if any(value is None for value in provenance):
+            raise LedgerError("filled terminal rows require complete exchange provenance")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(values["evidence_source_hash"])):
+            raise LedgerError("terminal evidence_source_hash must be SHA-256")
+        try:
+            entry_time = datetime.fromisoformat(str(values["entry_time_utc"]))
+            exit_time = datetime.fromisoformat(str(values["exit_time_utc"]))
+            reconciled_at = datetime.fromisoformat(str(values["reconciled_at_utc"]))
+        except ValueError as exc:
+            raise LedgerError("terminal exchange timestamps are invalid") from exc
+        if any(value.tzinfo is None or value.utcoffset() is None for value in (entry_time, exit_time, reconciled_at)):
+            raise LedgerError("terminal exchange timestamps must be timezone-aware")
+        if not entry_time <= exit_time <= reconciled_at:
+            raise LedgerError("terminal exchange timestamps are not chronologically ordered")
 
 
 def transition_intent(
@@ -800,6 +979,418 @@ def record_execution_evidence(
         raise LedgerError(f"could not record execution evidence: {exc}") from exc
 
 
+_EVENT_FIELDS = (
+    "exec_id",
+    "account_id",
+    "native_symbol",
+    "event_type",
+    "event_role",
+    "order_id",
+    "client_order_id",
+    "link_id",
+    "side",
+    "last_qty",
+    "last_price_usdt",
+    "commission_usdt",
+    "funding_usdt",
+    "realised_pnl_usdt",
+    "transact_time_utc",
+    "source_hash",
+)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_execution_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(event, Mapping):
+        raise LedgerError("execution event must be a mapping")
+    exec_id = _optional_text(event.get("exec_id"))
+    account_id = _optional_text(event.get("account_id"))
+    native_symbol = _optional_text(event.get("native_symbol"))
+    event_type = str(event.get("event_type", "")).strip().upper()
+    event_role = str(event.get("event_role", "")).strip().upper()
+    source_hash = str(event.get("source_hash", "")).strip().lower()
+    if not exec_id or not account_id:
+        raise LedgerError("execution event requires exec_id and account_id")
+    if native_symbol != "XBTUSDT":
+        raise LedgerError("execution event must be native XBTUSDT evidence")
+    if event_type not in {"TRADE", "FUNDING"}:
+        raise LedgerError("execution event type must be TRADE or FUNDING")
+    if event_role not in {"ENTRY", "EXIT", "FUNDING"}:
+        raise LedgerError("execution event role is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", source_hash):
+        raise LedgerError("execution event source_hash must be SHA-256")
+
+    last_qty = _whole_non_negative(event.get("last_qty"), "last_qty")
+    commission = _finite_number(event.get("commission_usdt"), "commission_usdt")
+    funding = _finite_number(event.get("funding_usdt"), "funding_usdt")
+    price_raw = event.get("last_price_usdt")
+    price = None if price_raw is None else _finite_number(price_raw, "last_price_usdt")
+    realised_raw = event.get("realised_pnl_usdt")
+    if realised_raw is None:
+        raise LedgerError("execution event requires native realised_pnl_usdt")
+    realised = _finite_number(realised_raw, "realised_pnl_usdt")
+    side = _optional_text(event.get("side"))
+    if side is not None:
+        side = side.upper()
+    order_id = _optional_text(event.get("order_id"))
+
+    if event_type == "TRADE":
+        if event_role not in {"ENTRY", "EXIT"}:
+            raise LedgerError("trade execution must be ENTRY or EXIT evidence")
+        if not order_id or side not in {"BUY", "SELL"}:
+            raise LedgerError("trade execution requires an order ID and side")
+        if last_qty <= 0 or price is None or price <= 0:
+            raise LedgerError("trade execution requires positive quantity and price")
+        if funding != 0:
+            raise LedgerError("trade execution cannot carry a funding amount")
+    else:
+        if event_role != "FUNDING":
+            raise LedgerError("funding execution must use the FUNDING role")
+        if price is not None or commission != 0:
+            raise LedgerError("funding execution has invalid trade fields")
+
+    return {
+        "exec_id": exec_id,
+        "account_id": account_id,
+        "native_symbol": native_symbol,
+        "event_type": event_type,
+        "event_role": event_role,
+        "order_id": order_id,
+        "client_order_id": _optional_text(event.get("client_order_id")),
+        "link_id": _optional_text(event.get("link_id")),
+        "side": side,
+        "last_qty": last_qty,
+        "last_price_usdt": price,
+        "commission_usdt": commission,
+        "funding_usdt": funding,
+        "realised_pnl_usdt": realised,
+        "transact_time_utc": _utc_timestamp(
+            event.get("transact_time_utc"), "transact_time_utc"
+        ),
+        "source_hash": source_hash,
+    }
+
+
+def _event_evidence_hash(events: Iterable[Mapping[str, Any]]) -> str:
+    components = sorted(
+        f"{event['exec_id']}:{event['source_hash']}:{event['event_role']}"
+        for event in events
+    )
+    return hashlib.sha256("\n".join(components).encode("utf-8")).hexdigest()
+
+
+def _weighted_average(events: list[Mapping[str, Any]], label: str) -> float:
+    quantity = sum(int(event["last_qty"]) for event in events)
+    if quantity <= 0:
+        raise LedgerError(f"{label} execution quantity is missing")
+    notional = sum(
+        float(event["last_price_usdt"]) * int(event["last_qty"])
+        for event in events
+    )
+    return notional / quantity
+
+
+def _derive_close_updates(
+    row: Mapping[str, Any], events: list[Mapping[str, Any]]
+) -> dict[str, Any]:
+    entries = [event for event in events if event["event_role"] == "ENTRY"]
+    exits = [event for event in events if event["event_role"] == "EXIT"]
+    funding_events = [
+        event for event in events if event["event_role"] == "FUNDING"
+    ]
+    filled = int(row["filled_contracts"])
+    entry_qty = sum(int(event["last_qty"]) for event in entries)
+    exit_qty = sum(int(event["last_qty"]) for event in exits)
+    if filled <= 0 or entry_qty != filled or exit_qty != filled:
+        raise LedgerError(
+            "execution events do not reconcile exactly to the durable filled quantity"
+        )
+    accounts = {str(event["account_id"]) for event in events}
+    if len(accounts) != 1:
+        raise LedgerError("execution events span multiple exchange accounts")
+
+    entry_average = _weighted_average(entries, "entry")
+    recorded_entry = float(row["actual_entry_price_usdt"])
+    tolerance = max(1e-8, abs(recorded_entry) * 1e-9)
+    if abs(entry_average - recorded_entry) > tolerance:
+        raise LedgerError("entry executions disagree with the durable entry average")
+    exit_average = _weighted_average(exits, "exit")
+
+    entry_time = min(str(event["transact_time_utc"]) for event in entries)
+    exit_time = max(str(event["transact_time_utc"]) for event in exits)
+    if datetime.fromisoformat(entry_time) > datetime.fromisoformat(exit_time):
+        raise LedgerError("exit executions precede the entry executions")
+    for event in funding_events:
+        timestamp = datetime.fromisoformat(str(event["transact_time_utc"]))
+        if not datetime.fromisoformat(entry_time) <= timestamp <= datetime.fromisoformat(
+            exit_time
+        ):
+            raise LedgerError("funding execution falls outside the position lifetime")
+
+    exit_order_ids = {str(event["order_id"]) for event in exits}
+    if len(exit_order_ids) != 1:
+        raise LedgerError("exit executions span multiple order legs")
+    exit_order_id = next(iter(exit_order_ids))
+    if exit_order_id == row["stop_order_id"]:
+        exit_reason = "stop_loss"
+    elif exit_order_id == row["target_order_id"]:
+        exit_reason = "take_profit"
+    elif exit_order_id == row["exit_order_id"]:
+        exit_reason = "emergency_close"
+    else:
+        raise LedgerError("exit execution is not attributable to a durable order leg")
+
+    fees = sum(
+        float(event["commission_usdt"])
+        for event in events
+        if event["event_type"] == "TRADE"
+    )
+    funding = sum(float(event["funding_usdt"]) for event in funding_events)
+    direction = 1.0 if row["side"] == "LONG" else -1.0
+    gross = (
+        filled
+        * float(row["contract_size_btc"])
+        * (exit_average - entry_average)
+        * direction
+    )
+    net = gross - fees + funding
+    native_net = sum(float(event["realised_pnl_usdt"]) for event in events)
+    native_tolerance = max(0.000001, abs(net) * 1e-9)
+    if abs(native_net - net) > native_tolerance:
+        raise LedgerError(
+            "native realised PnL disagrees with price, fee, and funding accounting"
+        )
+    return {
+        "closed_contracts": filled,
+        "actual_exit_price_usdt": exit_average,
+        "gross_pnl_usdt": gross,
+        "fees_usdt": fees,
+        "funding_usdt": funding,
+        "net_pnl_usdt": net,
+        "exit_reason": exit_reason,
+        "entry_time_utc": entry_time,
+        "exit_time_utc": exit_time,
+        "reconciled_at_utc": _utc_now(),
+        "evidence_source_hash": _event_evidence_hash(events),
+    }
+
+
+def verify_terminal_execution_evidence(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+) -> None:
+    """Recompute one filled terminal row from its immutable native events."""
+
+    row = dict(row)
+    status = str(row.get("status", "")).strip().upper()
+    filled = int(row.get("filled_contracts", 0))
+    if status not in {"CLOSED", "FAILED_FLAT", "HALTED_MANUAL"} or filled <= 0:
+        raise LedgerError("terminal evidence verification requires a filled terminal row")
+    intent_id = int(row["id"])
+    persisted = conn.execute(
+        "SELECT * FROM execution_events WHERE intent_id = ? "
+        "ORDER BY transact_time_utc, exec_id",
+        (intent_id,),
+    ).fetchall()
+    normalized = [_normalize_execution_event(dict(event)) for event in persisted]
+    if not normalized:
+        raise LedgerError("filled terminal row has no execution events")
+    expected = _derive_close_updates(row, normalized)
+
+    for field in (
+        "actual_exit_price_usdt",
+        "gross_pnl_usdt",
+        "fees_usdt",
+        "funding_usdt",
+        "net_pnl_usdt",
+    ):
+        actual = _finite_number(row.get(field), field)
+        calculated = _finite_number(expected[field], field)
+        tolerance = max(1e-8, abs(calculated) * 1e-9)
+        if abs(actual - calculated) > tolerance:
+            raise LedgerError(f"terminal {field} disagrees with execution events")
+    for field in ("exit_reason", "entry_time_utc", "exit_time_utc"):
+        if str(row.get(field)) != str(expected[field]):
+            raise LedgerError(f"terminal {field} disagrees with execution events")
+    actual_hash = str(row.get("evidence_source_hash", "")).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", actual_hash):
+        raise LedgerError("terminal evidence_source_hash must be SHA-256")
+    if actual_hash != expected["evidence_source_hash"]:
+        raise LedgerError("terminal evidence hash disagrees with execution events")
+
+    reconciled_at = _utc_timestamp(row.get("reconciled_at_utc"), "reconciled_at_utc")
+    if datetime.fromisoformat(reconciled_at) < datetime.fromisoformat(expected["exit_time_utc"]):
+        raise LedgerError("terminal reconciliation precedes the final exit execution")
+
+
+def close_intent_from_events(
+    decision_key: str,
+    *,
+    expected_statuses: Iterable[str],
+    events: Iterable[Mapping[str, Any]],
+    final_status: str = "CLOSED",
+    halt_reason: str | None = None,
+    db_path: str = DB_PATH,
+) -> dict[str, Any]:
+    """Append immutable exchange events and finalize accounting atomically.
+
+    Replaying the exact same event set after a lost response is idempotent.
+    Reusing an ``exec_id`` with changed source evidence or another intent is
+    rejected. Emergency accounting may finalize as ``HALTED_MANUAL`` so the
+    durable review gate is never cleared by successful flat-position accounting.
+    """
+
+    expected = {str(value).strip().upper() for value in expected_statuses}
+    if not expected or not expected <= ACTIVE_STATUSES:
+        raise LedgerError("close reconciliation requires active expected statuses")
+    final_status = str(final_status).strip().upper()
+    if final_status not in {"CLOSED", "HALTED_MANUAL"}:
+        raise LedgerError("reconciled accounting must close or remain manually halted")
+    if final_status == "HALTED_MANUAL":
+        if halt_reason is None or not str(halt_reason).strip():
+            raise LedgerError("manual-halt accounting requires a halt reason")
+    elif halt_reason is not None:
+        raise LedgerError("closed accounting cannot include a manual-halt reason")
+    normalized = [_normalize_execution_event(event) for event in events]
+    if not normalized:
+        raise LedgerError("close reconciliation requires execution events")
+    exec_ids = [event["exec_id"] for event in normalized]
+    if len(exec_ids) != len(set(exec_ids)):
+        raise LedgerError("close reconciliation contains duplicate exec_id values")
+
+    try:
+        with closing(_connect_existing(db_path)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM execution_intents WHERE decision_key = ?",
+                (decision_key,),
+            ).fetchone()
+            if row is None:
+                raise LedgerError(f"unknown decision_key {decision_key!r}")
+            current = str(row["status"])
+            intent_id = int(row["id"])
+
+            if current == final_status:
+                existing = conn.execute(
+                    "SELECT exec_id, source_hash, event_role FROM execution_events "
+                    "WHERE intent_id = ? ORDER BY exec_id",
+                    (intent_id,),
+                ).fetchall()
+                supplied = sorted(
+                    (event["exec_id"], event["source_hash"], event["event_role"])
+                    for event in normalized
+                )
+                persisted = sorted(
+                    (item["exec_id"], item["source_hash"], item["event_role"])
+                    for item in existing
+                )
+                if supplied != persisted:
+                    raise LedgerError(
+                        "reconciled intent was replayed with different execution evidence"
+                    )
+                verify_terminal_execution_evidence(conn, row)
+                conn.commit()
+                return dict(row)
+            if current not in expected:
+                raise LedgerError(
+                    f"expected status in {sorted(expected)}, found {current}"
+                )
+
+            created_at = _utc_now()
+            for event in normalized:
+                prior = conn.execute(
+                    "SELECT intent_id, source_hash, event_role FROM execution_events "
+                    "WHERE exec_id = ?",
+                    (event["exec_id"],),
+                ).fetchone()
+                if prior is not None:
+                    if (
+                        int(prior["intent_id"]) != intent_id
+                        or prior["source_hash"] != event["source_hash"]
+                        or prior["event_role"] != event["event_role"]
+                    ):
+                        raise LedgerError(
+                            "exec_id already exists with different execution evidence"
+                        )
+                    continue
+                columns = ("intent_id", *_EVENT_FIELDS, "created_at_utc")
+                values = (
+                    intent_id,
+                    *(event[field] for field in _EVENT_FIELDS),
+                    created_at,
+                )
+                conn.execute(
+                    f"INSERT INTO execution_events ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    values,
+                )
+
+            stored_events = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT * FROM execution_events WHERE intent_id = ? "
+                    "ORDER BY transact_time_utc, exec_id",
+                    (intent_id,),
+                ).fetchall()
+            ]
+            updates = _derive_close_updates(row, stored_events)
+            if final_status == "HALTED_MANUAL":
+                updates["halt_reason"] = str(halt_reason).strip()
+            changes = _normalize_updates(row, updates)
+            merged = _merged(row, changes)
+            _require_state_evidence("CLOSED", merged)
+            if final_status == "HALTED_MANUAL":
+                _require_state_evidence("HALTED_MANUAL", merged)
+            assignments = ["status = ?", "updated_at_utc = ?"]
+            params: list[Any] = [final_status, _utc_now()]
+            for field, value in changes.items():
+                assignments.append(f"{field} = ?")
+                params.append(value)
+            params.extend([decision_key, current])
+            cursor = conn.execute(
+                f"UPDATE execution_intents SET {', '.join(assignments)} "
+                "WHERE decision_key = ? AND status = ?",
+                params,
+            )
+            if cursor.rowcount != 1:
+                raise LedgerError("close reconciliation lost a concurrent update race")
+            closed = conn.execute(
+                "SELECT * FROM execution_intents WHERE decision_key = ?",
+                (decision_key,),
+            ).fetchone()
+            conn.commit()
+            if closed is None:
+                raise LedgerError("closed intent cannot be read")
+            return dict(closed)
+    except sqlite3.Error as exc:
+        raise LedgerError(f"could not close intent from execution events: {exc}") from exc
+
+
+def list_execution_events(
+    decision_key: str, db_path: str = DB_PATH
+) -> list[dict[str, Any]]:
+    """Return immutable normalized events for one durable intent."""
+
+    try:
+        with closing(_connect_existing(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT event.* FROM execution_events AS event "
+                "JOIN execution_intents AS intent ON intent.id = event.intent_id "
+                "WHERE intent.decision_key = ? "
+                "ORDER BY event.transact_time_utc, event.exec_id",
+                (decision_key,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except sqlite3.Error as exc:
+        raise LedgerError(f"could not list execution events: {exc}") from exc
+
+
 def get_intent(decision_key: str, db_path: str = DB_PATH) -> dict[str, Any] | None:
     try:
         with closing(_connect_existing(db_path)) as conn:
@@ -901,17 +1492,22 @@ __all__ = [
     "DB_PATH",
     "LedgerError",
     "TERMINAL_STATUSES",
+    "SCHEMA_VERSION",
     "UNIT_MODEL",
     "UNRESOLVED_STATUSES",
+    "close_intent_from_events",
     "get_intent",
     "get_intent_by_client_order_id",
     "get_intent_by_external_order_id",
     "initialize_ledger",
     "list_active_intents",
+    "list_execution_events",
     "list_open_intents",
     "record_execution_evidence",
     "register_intent",
     "transition_intent",
+    "validate_execution_ledger_schema",
+    "verify_terminal_execution_evidence",
 ]
 
 

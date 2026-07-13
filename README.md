@@ -64,6 +64,26 @@ BitMEX Testnet.
   or re-verifies the one unresolved intent. It will not trade around unknown
   entry exposure or unproven protection. Unresolved and managed states are
   checked every five seconds rather than waiting for the next signal candle.
+- Native exit reconciliation. Entry fills, exit fills, fees, funding, sibling
+  terminal state, and native `realisedPnl` are attributed from stable paginated BitMEX
+  Testnet execution history. Normalized execution events are append-only and
+  the ledger closes atomically only when quantities, identifiers, account,
+  sides, timestamps, evidence hash, native PnL, and independently calculated
+  price/fee/funding economics reconcile exactly. Incomplete or contradictory
+  evidence produces a manual halt. Daily loss and readiness recompute this
+  evidence before trusting terminal rows.
+- Independent state channel. A separate authenticated Testnet WebSocket
+  watchdog observes order, position, execution, and margin tables without any
+  order or cancellation method. It publishes only a bounded sanitized status
+  file and fails unhealthy on stale or inconsistent state.
+- Read-only operator dashboard. A one-way exporter converts the private ledger
+  and status files into an allowlisted snapshot. The authenticated web process
+  receives only that snapshot and has no exchange key, database, log, trading
+  code, control route, or Docker socket.
+- Hardened remote stack. The Coolify host deployment uses strict DNS-over-TLS,
+  digest-pinned images, non-root processes, read-only filesystems, dropped
+  capabilities, isolated named volumes, health checks, and a loopback-only
+  dashboard published privately with Tailscale Serve HTTPS.
 - Legacy evidence quarantine. `data/trades.db` mixed BTC and contract units,
   has application writes disabled, and is excluded from all readiness claims.
   The file itself is not made filesystem read-only.
@@ -75,20 +95,22 @@ BitMEX Testnet.
 - No authenticated mainnet exchange constructor or live-order switch.
 - No proven strategy edge. The funding strategy is historically
   regime-dependent and currently treated as an experimental hypothesis.
-- No complete, automated exit, fee, and funding reconciliation suitable for
-  unattended continuation after a protected position closes. If restart finds
-  a protected intent flat, it enters manual halt because post-exit sibling
-  cancellation verification, fill, fee, funding, and realized-PnL accounting
-  are not automated end to end.
-- No independent WebSocket watchdog, operator paging path, or tested host
-  failover.
+- No verified external paging delivery, operator response record, or tested
+  host failover. The watchdog supports an optional redacted HTTPS alert, but
+  configuration is not evidence that delivery and response drills passed.
+- The remote watchdog profile remains disabled until a separate exchange-side
+  read-only Testnet key is created. The runner's order-capable key is never
+  reused for the observer.
 - No completed promotion evidence: costed out-of-sample research, shadow
   duration, lifecycle drills, and mainnet dry-run evidence are absent locally.
+- No software proof of account MFA, exchange-side IP allowlisting, key rotation,
+  host recovery, or backup restoration. Those remain operator evidence gates.
 
 See [Real Funds Readiness](docs/REAL_FUNDS_READINESS.md) for the research,
 control matrix, evidence thresholds, and remaining blockers. See
 [Threat Model](docs/THREAT_MODEL.md) for security and operational failure
-scenarios.
+scenarios. See [Remote Deployment](docs/REMOTE_DEPLOYMENT.md) for the private
+Coolify-host and dashboard runbook.
 
 ## Risk profiles
 
@@ -159,10 +181,18 @@ main.py
   +-- execution_lock.py      thread and OS singleton execution authority
   +-- execution_safety.py    pure decision/order reconciliation primitives
   +-- trade_ledger.py        durable v2 execution lifecycle
+  +-- execution_reconciler.py stable native fill, fee, funding and exit proof
   +-- daily_loss_state.py    atomic loss state derived from reconciled v2 rows
+  +-- exchange_watchdog.py   independent read-only private WebSocket state
+  +-- operator_snapshot.py   one-way sanitized dashboard boundary
+  +-- dashboard.py           authenticated read-only operator interface
   +-- promotion.py           evidence stages, never production enablement
   +-- audit.py               local safety and real-funds no-go audit
 ```
+
+The remote Linux deployment is defined in `compose.remote.yml`. It is deployed
+only over SSH to the Coolify host. It does not run the bot on the local Windows
+workstation and it does not add authenticated mainnet execution.
 
 ## Evidence policy
 

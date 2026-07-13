@@ -28,7 +28,11 @@ from trade_ledger import (
     ACTIVE_STATUSES,
     ALL_STATUSES,
     DB_PATH as TRADE_DB_PATH,
+    LedgerError,
+    SCHEMA_VERSION,
     UNIT_MODEL,
+    validate_execution_ledger_schema,
+    verify_terminal_execution_evidence,
 )
 
 
@@ -56,6 +60,10 @@ _REQUIRED_LEDGER_COLUMNS = frozenset(
         "funding_usdt",
         "net_pnl_usdt",
         "exit_reason",
+        "entry_time_utc",
+        "exit_time_utc",
+        "reconciled_at_utc",
+        "evidence_source_hash",
     }
 )
 _UNPROTECTED_STATUSES = (
@@ -76,6 +84,8 @@ def _read_only_connection(path: str) -> sqlite3.Connection:
     uri_path = Path(path).resolve().as_posix()
     connection = sqlite3.connect(f"file:{uri_path}?mode=ro", uri=True, timeout=5)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA query_only=ON")
     return connection
 
 
@@ -104,6 +114,7 @@ def _ledger_metrics(path: str) -> dict[str, Any]:
         "invalid_contract_rows": 0,
         "invalid_signal_geometry_rows": 0,
         "invalid_accounting_rows": 0,
+        "invalid_evidence_rows": 0,
         "incomplete_closed_rows": 0,
         "closed_net_pnl_usdt": 0.0,
     }
@@ -129,6 +140,39 @@ def _ledger_metrics(path: str) -> dict[str, Any]:
             if missing:
                 metrics["error"] = "missing ledger columns: " + ", ".join(missing)
                 return metrics
+            version_row = connection.execute("PRAGMA user_version").fetchone()
+            if not version_row or int(version_row[0]) != SCHEMA_VERSION:
+                metrics["error"] = "ledger schema version is not current"
+                return metrics
+            event_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(execution_events)"
+                ).fetchall()
+            }
+            required_event_columns = {
+                "intent_id",
+                "exec_id",
+                "event_role",
+                "source_hash",
+                "transact_time_utc",
+            }
+            if not required_event_columns <= event_columns:
+                metrics["error"] = "execution evidence schema is incomplete"
+                return metrics
+            triggers = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                ).fetchall()
+            }
+            if not {
+                "execution_events_append_only_update",
+                "execution_events_append_only_delete",
+            } <= triggers:
+                metrics["error"] = "execution evidence is not append-only"
+                return metrics
+            validate_execution_ledger_schema(connection)
             metrics["schema_valid"] = True
 
             metrics["total_intents"] = _count(
@@ -202,7 +246,9 @@ def _ledger_metrics(path: str) -> dict[str, Any]:
                 "closed_contracts != filled_contracts OR actual_entry_price_usdt IS NULL "
                 "OR actual_exit_price_usdt IS NULL OR gross_pnl_usdt IS NULL "
                 "OR fees_usdt IS NULL OR funding_usdt IS NULL OR net_pnl_usdt IS NULL "
-                "OR exit_reason IS NULL OR trim(exit_reason) = ''))",
+                "OR exit_reason IS NULL OR trim(exit_reason) = '' "
+                "OR entry_time_utc IS NULL OR exit_time_utc IS NULL "
+                "OR reconciled_at_utc IS NULL OR evidence_source_hash IS NULL))",
             )
             accounting_rows = connection.execute(
                 "SELECT side, filled_contracts, contract_size_btc, "
@@ -241,17 +287,26 @@ def _ledger_metrics(path: str) -> dict[str, Any]:
                     contract_size <= 0
                     or entry <= 0
                     or exit_price <= 0
-                    or fees < 0
                     or abs(gross - expected_gross) > gross_tolerance
                     or abs(net - expected_net) > net_tolerance
                 ):
                     metrics["invalid_accounting_rows"] += 1
+            evidence_rows = connection.execute(
+                "SELECT * FROM execution_intents WHERE "
+                "status IN ('CLOSED', 'FAILED_FLAT', 'HALTED_MANUAL') "
+                "AND filled_contracts > 0"
+            ).fetchall()
+            for row in evidence_rows:
+                try:
+                    verify_terminal_execution_evidence(connection, row)
+                except LedgerError:  # agent-quality: allow: per-row evidence failure increments an explicit failing readiness metric
+                    metrics["invalid_evidence_rows"] += 1
             pnl_row = connection.execute(
                 "SELECT COALESCE(SUM(net_pnl_usdt), 0) FROM execution_intents "
                 "WHERE status = 'CLOSED'"
             ).fetchone()
             metrics["closed_net_pnl_usdt"] = float(pnl_row[0] or 0.0)
-    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:  # agent-quality: allow: failure is exposed in metrics.error and fails readiness
+    except (LedgerError, OSError, sqlite3.Error, TypeError, ValueError) as exc:  # agent-quality: allow: failure is exposed in metrics.error and fails readiness
         metrics["error"] = f"{type(exc).__name__}: {exc}"
     return metrics
 
@@ -340,6 +395,7 @@ def evaluate_live_readiness(
         + ledger["invalid_contract_rows"]
         + ledger["invalid_signal_geometry_rows"]
         + ledger["invalid_accounting_rows"]
+        + ledger["invalid_evidence_rows"]
     )
     ledger_eligible = (
         ledger["db_readable"]
@@ -380,7 +436,8 @@ def evaluate_live_readiness(
                 f"environments={ledger['invalid_environment_rows']}, "
                 f"contracts={ledger['invalid_contract_rows']}, "
                 f"signal geometry={ledger['invalid_signal_geometry_rows']}, "
-                f"accounting={ledger['invalid_accounting_rows']}"
+                f"accounting={ledger['invalid_accounting_rows']}, "
+                f"evidence={ledger['invalid_evidence_rows']}"
             )
             if ledger_eligible
             else unassessable,
