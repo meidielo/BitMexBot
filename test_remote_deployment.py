@@ -31,9 +31,14 @@ class RemoteDeploymentTests(unittest.TestCase):
         self.assertIn("trade_ledger.py", self.compose)
         self.assertIn("condition: service_completed_successfully", self.compose)
 
-    def test_dashboard_is_loopback_only_and_snapshot_has_no_network(self):
-        self.assertIn('"127.0.0.1:5000:8080"', self.compose)
+    def test_dashboard_has_private_static_ingress_and_snapshot_has_no_network(self):
+        dashboard_block = self.compose.split("  dashboard:", 1)[1].split(
+            "\nnetworks:", 1
+        )[0]
+        self.assertNotIn("ports:", dashboard_block)
+        self.assertIn("ipv4_address: 10.254.54.10", dashboard_block)
         self.assertIn("internal: true", self.compose)
+        self.assertIn("subnet: 10.254.54.0/24", self.compose)
         self.assertIn("DASH_SNAPSHOT_PATH: /snapshot/operator_status.json", self.compose)
 
     def test_resolver_is_tls_only_and_uses_non_overlapping_static_address(self):

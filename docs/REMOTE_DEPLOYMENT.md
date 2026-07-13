@@ -90,8 +90,8 @@ ledger before the runner can start. It is safe to run again on later deploys.
 Before starting the new runner, use a read-only private exchange query through
 the strict resolver to prove that the dedicated account is flat and has no open
 orders. Stop the legacy runner and legacy dashboard before starting the new
-stack. The old host-network dashboard already occupies port 5000. Never allow
-both runner processes to hold the same Testnet credentials concurrently.
+stack. Never allow both runner processes to hold the same Testnet credentials
+concurrently.
 
 Start and inspect the hardened stack:
 
@@ -106,13 +106,14 @@ dump environment values into terminal history.
 
 ## Private HTTPS dashboard
 
-The Compose stack binds the dashboard only to remote loopback at
-`127.0.0.1:5000`. It is not directly reachable from the public internet or the
-LAN. On the current remote host, publish it only to authenticated Tailscale
-peers with Tailscale Serve HTTPS:
+The Compose stack publishes no host port. The dashboard has the fixed address
+`10.254.54.10:8080` on an internal Docker bridge, with no default external
+route. The host can reach that bridge, but the public internet and LAN cannot.
+On the current remote host, publish it only to authenticated Tailscale peers
+with Tailscale Serve HTTPS:
 
 ```bash
-tailscale serve --bg --https=8443 http://127.0.0.1:5000
+tailscale serve --bg --https=8443 http://10.254.54.10:8080
 tailscale serve status
 ```
 
@@ -133,9 +134,9 @@ Expected checks after deployment:
 
 ```bash
 docker compose -f compose.remote.yml ps
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/healthz
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/readyz
+curl -sS -o /dev/null -w '%{http_code}\n' http://10.254.54.10:8080/healthz
+curl -sS -o /dev/null -w '%{http_code}\n' http://10.254.54.10:8080/
+curl -sS -o /dev/null -w '%{http_code}\n' http://10.254.54.10:8080/readyz
 ```
 
 The expected statuses are `200`, `401`, and `200` respectively once all

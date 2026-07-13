@@ -189,12 +189,11 @@ services:
     mem_limit: 256m
     cpus: 0.75
     logging: *default-logging
-    ports:
-      - "127.0.0.1:5000:8080"
     volumes:
       - dashboard-snapshot:/snapshot:ro
     networks:
       dashboard:
+        ipv4_address: 10.254.54.10
 
 networks:
   bitmexbot:
@@ -205,6 +204,9 @@ networks:
   dashboard:
     driver: bridge
     internal: true
+    ipam:
+      config:
+        - subnet: 10.254.54.0/24
 
 volumes:
   bitmexbot-data:

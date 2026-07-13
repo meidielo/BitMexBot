@@ -195,7 +195,8 @@ the two direct scripts above remain the required repository checks.
 ## Remote services
 
 The remote Coolify host uses the hardened Compose stack. The dashboard stays on
-remote loopback and is published privately through Tailscale Serve HTTPS.
+an internal Docker bridge with no host port and is published privately through
+Tailscale Serve HTTPS.
 
 ```bash
 docker compose -f compose.remote.yml ps

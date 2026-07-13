@@ -91,8 +91,9 @@ guards, backtest parameters, or signal logic.
 The remote deployment adds a strict application-local DNS-over-TLS resolver
 because the current host's ISP DNS path returned a hostname-mismatched
 interception certificate for BitMEX. Plaintext DNS fallback and disabled TLS
-verification are forbidden. The dashboard binds to remote loopback and is
-published only through private Tailscale Serve HTTPS. See
+verification are forbidden. The dashboard publishes no host port, stays on an
+internal Docker bridge, and is exposed only through private Tailscale Serve
+HTTPS. See
 [`docs/REMOTE_DEPLOYMENT.md`](docs/REMOTE_DEPLOYMENT.md).
 
 ## Dependency Triage
