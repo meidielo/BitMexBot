@@ -104,16 +104,25 @@ docker compose -f compose.remote.yml logs --tail=100 secure-dns runner watchdog 
 Do not print either environment file or use `docker inspect` output that would
 dump environment values into terminal history.
 
-## Private HTTPS dashboard
+## Private dashboard ingress
 
-The Compose stack publishes no host port. The dashboard has the fixed address
-`10.254.54.10:8080` on an internal Docker bridge, with no default external
-route. The host can reach that bridge, but the public internet and LAN cannot.
-On the current remote host, publish it only to authenticated Tailscale peers
-with Tailscale Serve HTTPS:
+The Compose stack publishes the dashboard only on the host's Tailscale address,
+`100.110.79.52:5000`. It never binds a public or LAN interface. Its Docker
+bridge uses a fixed address and disables IP masquerading, so the dashboard does
+not gain general internet egress. Tailscale encrypts peer-to-host traffic; the
+host-to-container hop stays inside the server.
+
+The working private URL is:
+
+```text
+http://100.110.79.52:5000/
+```
+
+When Tailscale Serve is enabled for the tailnet, prefer its browser-facing HTTPS
+endpoint and proxy directly to the fixed container address:
 
 ```bash
-tailscale serve --bg --https=8443 http://10.254.54.10:8080
+tailscale serve --yes --bg --https=8443 http://10.254.54.10:8080
 tailscale serve status
 ```
 
@@ -135,8 +144,8 @@ Expected checks after deployment:
 ```bash
 docker compose -f compose.remote.yml ps
 curl -sS -o /dev/null -w '%{http_code}\n' http://10.254.54.10:8080/healthz
-curl -sS -o /dev/null -w '%{http_code}\n' http://10.254.54.10:8080/
-curl -sS -o /dev/null -w '%{http_code}\n' http://10.254.54.10:8080/readyz
+curl -sS -o /dev/null -w '%{http_code}\n' http://100.110.79.52:5000/
+curl -sS -o /dev/null -w '%{http_code}\n' http://100.110.79.52:5000/readyz
 ```
 
 The expected statuses are `200`, `401`, and `200` respectively once all

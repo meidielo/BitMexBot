@@ -82,8 +82,8 @@ BitMEX Testnet.
   code, control route, or Docker socket.
 - Hardened remote stack. The Coolify host deployment uses strict DNS-over-TLS,
   digest-pinned images, non-root processes, read-only filesystems, dropped
-  capabilities, isolated named volumes, health checks, and an internal-only
-  dashboard with no host port, published privately with Tailscale Serve HTTPS.
+  capabilities, isolated named volumes, health checks, and a dashboard bound
+  only to the host's encrypted Tailscale interface with no public/LAN port.
 - Legacy evidence quarantine. `data/trades.db` mixed BTC and contract units,
   has application writes disabled, and is excluded from all readiness claims.
   The file itself is not made filesystem read-only.

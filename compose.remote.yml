@@ -189,6 +189,8 @@ services:
     mem_limit: 256m
     cpus: 0.75
     logging: *default-logging
+    ports:
+      - "100.110.79.52:5000:8080"
     volumes:
       - dashboard-snapshot:/snapshot:ro
     networks:
@@ -203,7 +205,8 @@ networks:
         - subnet: 10.254.53.0/24
   dashboard:
     driver: bridge
-    internal: true
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
     ipam:
       config:
         - subnet: 10.254.54.0/24
